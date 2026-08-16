@@ -4,14 +4,14 @@
 Exposes the BRS Signals API as MCP tools for AI agents.
 
 Endpoints wrapped:
-  /api/v2/convergence          → get_convergence        (Three Eyes architecture: all 3 engines + convergence score)
-  /api/v2/signal/current       → get_directional_bias   (bullish/bearish/WAIT with confidence)
-  /api/v2/signal/history       → get_signal_history     (Recent decoder decisions)
-  /api/v2/regime/current       → get_regime_current     (Market regime + active events)
-  /api/v2/fee-histogram/current → get_fee_histogram     (Mempool fee curve shape)
-  /api/v2/funding-divergence/current → get_funding_divergence (Cross-exchange funding squeeze)
-  /api/v2/stablecoin-flow/current → get_stablecoin_flows (Whale stablecoin transfers)
-  /api/v2/gamma                → get_gamma_exposure     (Dealer gamma + flip level)
+  /api/v2/confidence          → get_convergence        (Three Eyes architecture: all 3 engines + convergence score)
+  /api/v2/bias       → get_directional_bias   (bullish/bearish/WAIT with confidence)
+  /api/v2/bias/history       → get_signal_history     (Recent decoder decisions)
+  /api/v2/structure       → get_regime_current     (Market regime + active events)
+  /api/v2/streams/fees → get_fee_histogram     (Mempool fee curve shape)
+  /api/v2/streams/funding → get_funding_divergence (Cross-exchange funding squeeze)
+  /api/v2/streams/stablecoin → get_stablecoin_flows (Whale stablecoin transfers)
+  /api/v2/streams/gamma                → get_gamma_exposure     (Dealer gamma + flip level)
   /api/v2/dashboard            → get_dashboard          (Bundled regime + signal + funding)
   /api/v2/system/counters      → get_system_counters    (Live data counters)
   /api/v1/system/health        → get_system_health      (Quick health check)
@@ -28,17 +28,31 @@ from typing import Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ── Configuration ──────────────────────────────────────────────────
 
-BASE_URL = os.environ.get("BRS_API_URL", "https://api.brs-signals.com")
+# api.brs-signals.com has no DNS record (verified Aug 15) — default to the
+# working public host. Override via BRS_API_URL for self-host.
+BASE_URL = os.environ.get("BRS_API_URL", "https://brs-signals.com")
 API_KEY = os.environ.get("BRS_API_KEY")
+
+# DNS-rebinding protection stays ON; the public host (via cloudflared) is added
+# to the allowlist so the forwarded `Host: brs-signals.com` is not rejected (421).
+_ALLOWED_HOSTS = [
+    "127.0.0.1:*", "localhost:*", "[::1]:*",
+    "brs-signals.com", "www.brs-signals.com",
+]
 
 mcp = FastMCP(
     "brs-signals",
     instructions="₿RS Signals — Bitcoin regime-switch detection before price moves. "
     "Three Eyes architecture: on-chain (fee curves), off-chain (funding divergence), "
     "and absence detection (shadow). Real-time bullish/bearish/WAIT signals for AI agents.",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_ALLOWED_HOSTS,
+    ),
 )
 
 # ── Shared HTTP Client ─────────────────────────────────────────────
@@ -68,7 +82,7 @@ async def _get(endpoint: str, timeout: float = 15.0) -> dict:
             if r.status_code == 402:
                 return {
                     "error": "Payment required (x402)",
-                    "amount": "$60/month (Pro tier)",
+                    "amount": "$50/month (Pro tier)",
                     "how_to_pay": (
                         "Send USDC via Solana Pay or sign up at "
                         "https://brs-signals.com"
@@ -101,52 +115,55 @@ def _fmt(data: dict) -> str:
 
 @mcp.tool()
 async def get_convergence() -> str:
-    """Get the full Three Eyes convergence picture.
+    """How much do the three independent sensors agree right now?
 
-    Returns:
-        - All three engine verdicts (X-Ray inner eye, SolarRay outer eye, Shadow invisible eye)
-        - Convergence score (0.0–1.0): how much the engines agree
-        - Which meta-regime is dominant (TRENDING_UP, TRENDING_DOWN, RANGE_ACCUMULATION, RANGE_DISTRIBUTION)
-        - shift_brewing: True if entropy is rising (regime change may be imminent)
-        - Gamma exposure data
-        - System-wide entropy gradient
+    Call this BEFORE trusting any directional read. Agreement is scored
+    pairwise: 1.00 same meta-regime, 0.85 same direction, 0.60 one sensor
+    silent, 0.25 open conflict, 0.00 unreadable. High agreement means
+    conditions are worth acting on; low agreement means the sensors are
+    looking at different markets and the honest answer is wait.
 
-    Use this to understand the overall market structure before making directional decisions.
+    Returns all three verdicts (X-Ray on-chain, Pulse off-chain, Shadow
+    absence), the convergence score, the dominant meta-regime
+    (TRENDING_UP, TRENDING_DOWN, RANGE_ACCUMULATION, RANGE_DISTRIBUTION),
+    shift_brewing (entropy rising = regime change may be imminent), gamma
+    exposure, and the system entropy gradient.
     """
-    return _fmt(await _get("/api/v2/convergence"))
+    return _fmt(await _get("/api/v2/confidence"))
 
 
 @mcp.tool()
 async def get_directional_bias() -> str:
-    """Get the current directional bias (bullish/bearish/WAIT) with confidence.
+    """Should you be trading Bitcoin right now, and in which direction?
 
-    Returns:
-        - side: bullish, bearish, or WAIT (when no clear edge)
-        - confidence: Adjusted confidence 0–100%
-        - raw_conviction: Raw conviction before regime adjustment
-        - regime: Meta-regime the signal was generated in
-        - zone: Price zone (low/mid/high)
-        - reason: Human-readable explanation of the signal
-        - suppressed: True if signal was suppressed (noise filter)
-        - btc_price: BTC price when signal was generated
-        - timestamp: When the signal was generated
+    Returns side (bullish / bearish / WAIT) with confidence, the regime
+    and zone the call was made in, the reason, btc_price and timestamp.
+    WAIT is the most common answer and means no edge exists — respect it;
+    do not force a trade. Confidence is normalised against how much
+    evidence was reachable: sent signals typically land 0.30–0.50, so
+    compare against the distribution, not 1.0. Signals suppressed by the
+    noise filter are shown (suppressed=true), never hidden.
 
-    The WAIT side means the system sees no edge — do NOT force a trade.
-    Suppressed signals were filtered by the noise detector.
+    Requires a Pro API key or x402 payment. Free alternative:
+    get_convergence.
     """
-    return _fmt(await _get("/api/v2/signal/current"))
+    return _fmt(await _get("/api/v2/bias"))
 
 
 @mcp.tool()
 async def get_signal_history(limit: int = 20) -> str:
-    """Get recent decoder decisions (bullish/bearish/WAIT with ZLMA filtering).
+    """The public audit trail: recent calls and what Bitcoin did next.
+
+    Each record carries timestamp, side, confidence, regime, zone, reason,
+    plus outcomes where resolved (+4h/+24h returns, worst drawdown). Use
+    this to verify rather than trust: the entire record is public, and
+    auditing it is the intended use. Nothing is withheld and outcomes are
+    never re-scored after the fact.
 
     Args:
         limit: Number of recent signals to return (1–200, default 20)
-
-    Returns list of signals with: timestamp, side, confidence, regime, zone, reason.
     """
-    return _fmt(await _get(f"/api/v2/signal/history?limit={min(limit, 200)}"))
+    return _fmt(await _get(f"/api/v2/bias/history?limit={min(limit, 200)}"))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -155,16 +172,15 @@ async def get_signal_history(limit: int = 20) -> str:
 
 @mcp.tool()
 async def get_regime_current() -> str:
-    """Get the current Bitcoin market regime with conviction.
+    """Which game is the market playing right now?
 
-    Returns:
-        - latest_event: Most recent regime event (event_type, conviction, direction, etc.)
-        - active_events: All currently active regime events
-
-    Regime types include: ACCUMULATION, DISTRIBUTION, SQUEEZE_IMMINENT, TRENDING, etc.
-    Use this to understand the broader market phase before interpreting individual signals.
+    Returns the current regime with conviction and how long it has held —
+    accumulation, distribution, trending, reorganizing — as latest_event
+    plus all active_events. Use it to pick the playbook (trend-following
+    vs mean-reversion vs sit out) BEFORE interpreting any individual
+    reading. Free tier, no key needed.
     """
-    return _fmt(await _get("/api/v2/regime/current"))
+    return _fmt(await _get("/api/v2/structure"))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -173,7 +189,11 @@ async def get_regime_current() -> str:
 
 @mcp.tool()
 async def get_fee_histogram() -> str:
-    """Get the current mempool fee curve shape and statistics.
+    """Who is transacting on-chain right now — X-Ray's raw read (Pro).
+
+    The mempool fee curve shape: FLAT_WIDE means patient accumulation,
+    STEEP_TALL means urgency or panic, BIMODAL means whale activity.
+
 
     Returns:
         - curve_type: FLAT_WIDE (accumulation), STEEP_TALL (retail panic), BIMODAL (whale activity), etc.
@@ -186,12 +206,17 @@ async def get_fee_histogram() -> str:
     FLAT_WIDE fee curves indicate accumulation (whales being patient).
     STEEP_TALL fee curves indicate urgency/panic (retail rushing transactions).
     """
-    return _fmt(await _get("/api/v2/fee-histogram/current"))
+    return _fmt(await _get("/api/v2/streams/fees"))
 
 
 @mcp.tool()
 async def get_funding_divergence() -> str:
-    """Get cross-exchange funding rate divergence and squeeze probability.
+    """Is positioning one-sided enough to squeeze? (Pro stream)
+
+    Cross-exchange funding spread, velocity, and squeeze probability.
+    Contrarian by design: the market usually reverses against the crowded
+    side.
+
 
     Returns:
         - squeeze_probability: 0–100% chance of a funding squeeze
@@ -203,12 +228,16 @@ async def get_funding_divergence() -> str:
     High squeeze probability means traders are piling onto one side —
     the market usually reverses against them. This is a contrarian signal.
     """
-    return _fmt(await _get("/api/v2/funding-divergence/current"))
+    return _fmt(await _get("/api/v2/streams/funding"))
 
 
 @mcp.tool()
 async def get_stablecoin_flows() -> str:
-    """Get stablecoin whale transfer flows (USDT on Tron, USDC on Solana).
+    """Whale buying or selling intent before it reaches exchanges (Pro).
+
+    Large USDT (Tron) and USDC (Solana) movements: inflow surges precede
+    buying pressure, outflow surges precede distribution.
+
 
     Returns:
         - flow_regime: NORMAL, INFLOW_SURGE (buying pressure), OUTFLOW_SURGE (selling pressure)
@@ -219,12 +248,15 @@ async def get_stablecoin_flows() -> str:
     Large USDT inflows to exchange wallets = imminent buying pressure.
     Large USDT outflows from exchange wallets = whales cashing out.
     """
-    return _fmt(await _get("/api/v2/stablecoin-flow/current"))
+    return _fmt(await _get("/api/v2/streams/stablecoin"))
 
 
 @mcp.tool()
 async def get_gamma_exposure() -> str:
-    """Get dealer gamma exposure and gamma flip level.
+    """Where does dealer hedging amplify or dampen the move? (Pro stream)
+
+    Net dealer gamma and the flip level that acts as a price magnet.
+
 
     Returns:
         - dealer_net_gamma: Net dealer gamma position
@@ -236,7 +268,7 @@ async def get_gamma_exposure() -> str:
     with the trend (accelerating). Below flip = dealers hedge against the trend
     (dampening). Large negative gamma = explosive potential.
     """
-    return _fmt(await _get("/api/v2/gamma"))
+    return _fmt(await _get("/api/v2/streams/gamma"))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -245,7 +277,10 @@ async def get_gamma_exposure() -> str:
 
 @mcp.tool()
 async def get_dashboard() -> str:
-    """Get the full dashboard bundle: regime + signal + funding + suppressed signals.
+    """The full picture in one call (Pro). Use the individual tools when
+    you want one answer cheaply; use this when you want everything at once.
+
+    Bundle: regime + signal + funding + suppressed signals.
 
     Returns:
         - regime_meta: Full regime classification with confidence and range info
@@ -263,17 +298,21 @@ async def get_dashboard() -> str:
 
 @mcp.tool()
 async def get_system_health() -> str:
-    """Quick health check of the BRS Signals system.
+    """Is the instrument operational right now?
 
-    Returns component status (ok/error) for all data collectors and engines.
-    Use this to verify the API is operational before relying on its signals.
+    Component-by-component status for all collectors and engines. Call
+    this first if any reading looks stale or absent — a sensor being down
+    changes what every other answer means.
     """
     return _fmt(await _get("/api/v1/system/health"))
 
 
 @mcp.tool()
 async def get_system_counters() -> str:
-    """Get live data counters: total signals fired, data points collected, days tracking.
+    """The sample size behind everything: signals sent, data points
+    collected, days collecting. Small samples cannot prove an edge — this
+    tells you exactly how small.
+
 
     Returns:
         - signals_fired: Total number of trade signals generated
@@ -395,8 +434,77 @@ async def get_block_tip() -> str:
 # Entry Point
 # ═══════════════════════════════════════════════════════════════════
 
+def _run_streamable_http(args) -> None:
+    """Run the streamable-http transport, with an OPT-IN API-key gate.
+
+    The public endpoint proxies to the BRS API, which already gates Pro
+    endpoints and rate-limits the free tier. `--require-key` adds a second
+    layer so the endpoint is not an open firehose: every request must present
+    the server key via `Authorization: Bearer <BRS_MCP_SERVER_KEY>` or
+    `X-API-Key: <BRS_MCP_SERVER_KEY>` (constant-time comparison). Default OFF
+    so the free-tier UX is unchanged — the operator opts in at launch.
+    """
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    app = mcp.streamable_http_app()
+
+    require = bool(args.require_key)
+    expected = os.environ.get("BRS_MCP_SERVER_KEY", "") if require else ""
+    if require and not expected:
+        print("WARNING: --require-key set but BRS_MCP_SERVER_KEY is empty — "
+              "auth DISABLED; set BRS_MCP_SERVER_KEY to enforce.")
+        require = False
+
+    # Q58 security ruling: the public /mcp must run KEYLESS (free-tier proxy).
+    # A server BRS_API_KEY would turn /mcp into a free Pro firehose (no
+    # revocation, no `?ref=` attribution). Log the tier at startup so the
+    # exposure is visible before the endpoint serves.
+    _server_key = os.environ.get("BRS_API_KEY", "")
+    tier = ("KEYLESS (free-tier proxy)" if not _server_key
+            else "KEYED — BRS_API_KEY set (REJECTED for public launch per Q58)")
+    # flush=True: stdout is block-buffered to a file under pm2; the tier must
+    # be visible in the pm2 log at startup (Q58 launch condition #1).
+    print(f"[brs-mcp] startup tier: {tier}", flush=True)
+    print(f"[brs-mcp] streamable-http {args.host}:{args.port}{args.mount_path} "
+          f"· key gate={'ON' if require else 'OFF'}", flush=True)
+    if _server_key:
+        print("WARNING: BRS_API_KEY is set — per Q58 do NOT run the public "
+              "/mcp keyed (free Pro firehose, no revocation). Remove it.",
+              flush=True)
+
+    if require:
+        import hmac
+
+        class _KeyAuth(BaseHTTPMiddleware):
+            def __init__(self, app, expected_key: str = ""):
+                super().__init__(app)
+                self._expected = expected_key
+
+            async def dispatch(self, request, call_next):
+                auth = request.headers.get("authorization", "")
+                key = request.headers.get("x-api-key", "")
+                if auth.startswith("Bearer "):
+                    key = auth[len("Bearer "):].strip()
+                ok = bool(key) and hmac.compare_digest(key, self._expected)
+                if not ok:
+                    return JSONResponse(
+                        {"error": "Unauthorized — set BRS_API_KEY "
+                                  "(Authorization: Bearer <key> or X-API-Key)"},
+                        status_code=401,
+                    )
+                return await call_next(request)
+
+        app.add_middleware(_KeyAuth, expected_key=expected)
+
+    config = uvicorn.Config(app, host=args.host, port=args.port,
+                            log_level="info")
+    uvicorn.Server(config).run()
+
+
 def main():
-    """Run the MCP server. Supports stdio (default) and SSE/HTTP transports."""
+    """Run the MCP server. stdio (default), sse, or streamable-http."""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -404,29 +512,46 @@ def main():
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "streamable-http"],
         default="stdio",
-        help="Transport protocol: stdio (local agents) or sse (remote agents over HTTP)",
+        help="Transport: stdio (local) | sse (legacy HTTP) | "
+             "streamable-http (modern MCP over HTTP, /mcp)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
-        help="Port for SSE/HTTP transport (default: 8000)",
+        default=8123,
+        help="Port for HTTP transports (default: 8123)",
     )
     parser.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="Host for SSE/HTTP transport (default: 127.0.0.1)",
+        default="0.0.0.0",
+        help="Host for HTTP transports (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--mount-path",
+        default="/mcp",
+        help="Streamable-HTTP mount path (default: /mcp)",
+    )
+    parser.add_argument(
+        "--require-key",
+        action="store_true",
+        help="Require BRS_MCP_SERVER_KEY via Authorization/X-API-Key header "
+             "(opt-in; default off so free tier is unchanged)",
     )
     args = parser.parse_args()
 
-    if args.transport == "sse":
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    elif args.transport == "sse":
         mcp.settings.host = args.host
         mcp.settings.port = args.port
         mcp.run(transport="sse")
-    else:
-        mcp.run(transport="stdio")
+    else:  # streamable-http
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.settings.streamable_http_path = args.mount_path
+        _run_streamable_http(args)
 
 
 if __name__ == "__main__":

@@ -309,7 +309,7 @@ Returns: `block_height`.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `BRS_API_KEY` | No | — | Your API key (Pro/Max tier). Free tier works without one. |
-| `BRS_API_URL` | No | `https://api.brs-signals.com` | Override API base URL (for self-hosted instances) |
+| `BRS_API_URL` | No | `https://brs-signals.com` | Override API base URL (for self-hosted instances). NOTE: `api.brs-signals.com` has no DNS record (verified Aug 15) — do not use it. |
 
 ---
 
@@ -357,7 +357,7 @@ Get a key at [https://brs-signals.com](https://brs-signals.com).
 └─────────────────────────────────────────┼────────────┘
                                           │ HTTPS
 ┌─────────────────────────────────────────▼────────────┐
-│            api.brs-signals.com                        │
+│              brs-signals.com                          │
 │  ┌─────────────────────────────────────────────────┐ │
 │  │  Three Eyes Architecture                        │ │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐        │ │
@@ -426,6 +426,37 @@ python3 mcp_brs/server.py
 # Run (SSE — for remote agents, test with curl)
 python3 mcp_brs/server.py --transport sse --port 8080
 ```
+
+---
+
+## Health probe — verify tools return DATA, not just a handshake
+
+Aug 15 lesson: the public endpoint passed `initialize` (200) but every tool
+returned "Cannot connect to https://api.brs-signals.com" — that subdomain
+has no DNS record. The handshake proves routing, NOT that data flows. After
+any launch/restart, call a real tool:
+
+```python
+# streamable-http flow: initialize -> notifications/initialized -> tools/call
+import httpx
+BASE = "https://brs-signals.com/mcp"
+H = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+r = httpx.post(BASE, headers=H, json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "probe", "version": "1.0"}}}, timeout=20)
+sid = r.headers.get("mcpsessionid") or r.headers.get("mcp-session-id")
+def call(m, p):
+    h = dict(H); h["Mcp-Session-Id"] = sid
+    return httpx.post(BASE, headers=h, json={"jsonrpc": "2.0", "id": 1, "method": m, "params": p}, timeout=20)
+call("notifications/initialized", {})
+print(call("tools/call", {"name": "get_convergence", "arguments": {}}).text[:200])        # EXPECT real JSON
+print(call("tools/call", {"name": "get_directional_bias", "arguments": {}}).text[:200])   # EXPECT 402 x402
+```
+
+Expected: `get_convergence` / `get_regime_current` → real data (keyless
+free tier); `get_directional_bias` / `get_signal_history` → the 402 x402
+message (the gate works through the MCP). Anything else = upstream
+misconfigured.
 
 ---
 
