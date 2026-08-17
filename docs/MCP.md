@@ -478,9 +478,8 @@ headers = {
 - Valid key → the caller's own tier (Pro data), attributed to their key.
 - Invalid key → upstream 401 `Invalid or missing API key`.
 
-> **Aug 17 build — K3 review pending.** This is the public-`/mcp` follow-up
-> Q58 reserved as "separate build, separate review". Held from the live
-> restart until K3 signs off. Review brief:
+> **Aug 17 — DEPLOYED (K3-approved).** Clients can now send their own key to
+> unlock Pro per-request. Review brief:
 > [`plans/Q58-OptionC_k3_review.md`](../plans/Q58-OptionC_k3_review.md).
 
 ---
