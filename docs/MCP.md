@@ -460,6 +460,31 @@ misconfigured.
 
 ---
 
+## Per-client key pass-through (Q58 Option C)
+
+Clients may send their **own** `BRS_API_KEY` on the MCP HTTP requests to
+unlock their own tier per-request (Pro tools, per-key rate attribution).
+The server never holds the key and never logs it.
+
+```
+# send on every streamable-http request (initialize + each tools/call):
+headers = {
+  "Accept": "application/json, text/event-stream",
+  "X-API-Key": "va_yourkey_here",            # or: Authorization: Bearer va_yourkey_here
+}
+```
+
+- No key → free tier (unchanged; Pro tools return the 402 x402 message).
+- Valid key → the caller's own tier (Pro data), attributed to their key.
+- Invalid key → upstream 401 `Invalid or missing API key`.
+
+> **Aug 17 build — K3 review pending.** This is the public-`/mcp` follow-up
+> Q58 reserved as "separate build, separate review". Held from the live
+> restart until K3 signs off. Review brief:
+> [`plans/Q58-OptionC_k3_review.md`](../plans/Q58-OptionC_k3_review.md).
+
+---
+
 ## Related Docs
 
 - [BRS Signals API Docs](https://brs-signals.com/docs)
