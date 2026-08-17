@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "brs-signals-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "Live Bitcoin market regime for agents: three sensors read on-chain, off-chain and absence every 30s, reject almost everything, and emit a directional call with evidence when they converge. Public, agent-auditable track record. MCP + REST + x402. Free tier, no card."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,7 +31,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
+    # server.py targets the mcp 1.x SDK: it imports mcp.server.fastmcp.FastMCP
+    # and mcp.server.transport_security (DNS-rebinding protection), and calls
+    # mcp.streamable_http_app(). mcp 2.0.0 restructured all of that, so the
+    # upper bound is REQUIRED — an unbounded install picks up 2.0.0 and breaks
+    # at import. (Upgrading to mcp 2.x is a separate build; verified live on 1.28.0.)
+    "mcp>=1.28.0,<2.0.0",
     "httpx>=0.25.0",
 ]
 
@@ -46,4 +51,15 @@ Repository = "https://github.com/brssignals/BRS-Signals-MCP"
 "X (Twitter)" = "https://x.com/brssignals"
 
 [tool.hatch.build.targets.wheel]
-packages = ["mcp_brs"]
+# This pyproject lives inside the package dir (mcp_brs/). "packages =
+# ['mcp_brs']" ships an EMPTY wheel and "packages = ['.']" flattens the files
+# to the wheel root (breaks `import mcp_brs` + the brs-mcp entry point).
+# force-include places the files under the mcp_brs/ namespace (Aug 17 catch).
+packages = []
+force-include = { "." = "mcp_brs" }
+
+[tool.hatch.build.targets.wheel.exclude]
+"/dist" = "*"
+"/__pycache__" = "*"
+"/*.pyc" = "*"
+"/pyproject.toml" = "*"
