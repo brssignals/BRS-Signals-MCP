@@ -22,6 +22,7 @@ Auth: Set BRS_API_KEY env var for paid tiers (Pro/Max).
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 from typing import Optional
@@ -36,6 +37,15 @@ from mcp.server.transport_security import TransportSecuritySettings
 # working public host. Override via BRS_API_URL for self-host.
 BASE_URL = os.environ.get("BRS_API_URL", "https://brs-signals.com")
 API_KEY = os.environ.get("BRS_API_KEY")
+
+# Q58 Option C — per-client key pass-through. An HTTP request may carry the
+# caller's own BRS key (Authorization: Bearer <key> or X-API-Key: <key>); the
+# streamable-http middleware stashes it here for the request's duration and
+# _headers() forwards it verbatim upstream. The server holds no key material
+# and never logs it. No key on the request => free tier (keyless proxy).
+_client_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "brs_client_key", default=""
+)
 
 # DNS-rebinding protection stays ON; the public host (via cloudflared) is added
 # to the allowlist so the forwarded `Host: brs-signals.com` is not rejected (421).
@@ -58,10 +68,12 @@ mcp = FastMCP(
 # ── Shared HTTP Client ─────────────────────────────────────────────
 
 def _headers() -> dict:
-    """Build request headers. Free tier: no key. Pro/Max: X-API-Key."""
+    """Build request headers. Per-client key (Q58 Option C) wins over the
+    server env key; none => free tier (keyless). Never logged."""
     h = {}
-    if API_KEY:
-        h["X-API-Key"] = API_KEY
+    key = _client_key.get() or API_KEY or ""
+    if key:
+        h["X-API-Key"] = key
     return h
 
 
@@ -449,6 +461,30 @@ def _run_streamable_http(args) -> None:
     from starlette.responses import JSONResponse
 
     app = mcp.streamable_http_app()
+
+    # Q58 Option C — per-client key pass-through (always on, independent of the
+    # --require-key gate). Capture the caller's own key from the request and
+    # forward it verbatim upstream; server holds nothing, never logs. No key =>
+    # free tier; a key => that caller's own tier (per-key rate attribution
+    # preserved upstream). Visibility: logged as enabled at startup.
+    class _ClientKeyPass(BaseHTTPMiddleware):
+        def __init__(self, inner_app):
+            super().__init__(inner_app)
+
+        async def dispatch(self, request, call_next):
+            auth = request.headers.get("authorization", "")
+            key = ""
+            if auth.lower().startswith("bearer "):
+                key = auth[7:].strip()
+            else:
+                key = (request.headers.get("x-api-key") or "").strip()
+            token = _client_key.set(key)
+            try:
+                return await call_next(request)
+            finally:
+                _client_key.reset(token)
+
+    app.add_middleware(_ClientKeyPass)
 
     require = bool(args.require_key)
     expected = os.environ.get("BRS_MCP_SERVER_KEY", "") if require else ""
