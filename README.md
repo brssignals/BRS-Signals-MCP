@@ -3,10 +3,11 @@
 `mcp-name: io.github.brssignals/brs-signals-mcp`
 
 Live Bitcoin market regime for AI agents: three independent sensors read
-on-chain, off-chain and absence data every 30s and reject almost everything —
-when they converge, you get a directional call with the evidence attached.
-Public track record your agent can audit in one call. MCP + REST + x402.
-Free tier, no card.
+pre-price data — fee curves, funding velocity, whale flows, absence — every
+30s and reject almost everything. When they converge, you get a directional
+call with the evidence attached. The data doesn't exist in history; it exists
+right now and can't be reconstructed. Public track record your agent can
+audit in one call. MCP + REST + x402. Free tier, no card.
 
 ## Use it in 30 seconds — remote, no install
 
