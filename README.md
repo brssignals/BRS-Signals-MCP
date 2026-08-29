@@ -124,7 +124,7 @@ When all three agree → conviction. When they disagree → silence.
 - **Per-call ($0.01/query)** — Pro bias, pay-as-you-go via x402 (USDC on
   Solana): hit `/api/v2/bias/per-call`, pay the 402, retry with
   `?tx_signature=` + your free key. Capped at $50 per rolling 30 days, then
-  converts to Pro — never more than $50 in any 30 days. Solana now, Base next.
+  converts to Pro — never more than $50 in any 30 days. Solana + Base.
 - **x402** — Agents with wallets pay per access in USDC; no signup, no human
 - **Founding rate** — Use code `FOUNDING50` at checkout: $30/mo for 3 months (first 50 subscribers only)
 
