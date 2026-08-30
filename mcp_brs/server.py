@@ -4,17 +4,22 @@
 Exposes the BRS Signals API as MCP tools for AI agents.
 
 Endpoints wrapped:
-  /api/v2/confidence          → get_convergence        (Three Eyes architecture: all 3 engines + convergence score)
-  /api/v2/bias       → get_directional_bias   (bullish/bearish/WAIT with confidence)
-  /api/v2/bias/history       → get_signal_history     (Recent decoder decisions)
-  /api/v2/structure       → get_regime_current     (Market regime + active events)
-  /api/v2/streams/fees → get_fee_histogram     (Mempool fee curve shape)
-  /api/v2/streams/funding → get_funding_divergence (Cross-exchange funding squeeze)
-  /api/v2/streams/stablecoin → get_stablecoin_flows (Whale stablecoin transfers)
-  /api/v2/streams/gamma                → get_gamma_exposure     (Dealer gamma + flip level)
-  /api/v2/dashboard            → get_dashboard          (Bundled regime + signal + funding)
-  /api/v2/system/counters      → get_system_counters    (Live data counters)
-  /api/v1/system/health        → get_system_health      (Quick health check)
+  /api/v2/confidence          → get_convergence        (Three Eyes: all 3 engines + convergence score)
+  /api/v2/bias                → get_directional_bias   (bullish/bearish/WAIT with confidence)
+  /api/v2/bias/history        → get_signal_history     (Recent decoder decisions)
+  /api/v2/structure           → get_regime_current     (Market regime + active events)
+  /api/v2/streams/fees        → get_fee_histogram      (Mempool fee curve shape)
+  /api/v2/streams/funding     → get_funding_divergence (Cross-exchange funding squeeze)
+  /api/v2/streams/stablecoin  → get_stablecoin_flows   (Whale stablecoin transfers)
+  /api/v2/streams/gamma       → get_gamma_exposure     (Dealer gamma + flip level)
+  /api/v2/dashboard           → get_dashboard          (Bundled regime + signal + funding)
+  /api/v2/system/counters     → get_system_counters    (Live data counters)
+  /api/v2/health/funnel       → get_rejection_funnel   (Per-gate cycle counts: why no signal)
+  /api/v1/system/health       → get_system_health      (Quick health check)
+  (no API)                    → query_db               (Read-only SQL against the BRS SQLite DB)
+  (mempool.space)             → get_mempool_fees       (Recommended fee rates, sat/vB)
+  (mempool.space)             → get_mempool_stats      (Pending tx count, vsize, total fees)
+  (mempool.space)             → get_block_tip          (Current block height)
 
 Auth: Set BRS_API_KEY env var for paid tiers (Pro/Max).
       Free tier works without a key (rate-limited).
@@ -94,11 +99,13 @@ async def _get(endpoint: str, timeout: float = 15.0) -> dict:
             if r.status_code == 402:
                 return {
                     "error": "Payment required (x402)",
+                    "pro_required": True,
                     "amount": "$50/month (Pro tier)",
                     "how_to_pay": (
                         "Send USDC via Solana Pay or sign up at "
                         "https://brs-signals.com"
                     ),
+                    "upgrade_url": "https://brs-signals.com/signup",
                     "free_tier": "Get a free API key for regime data (5 req/min)",
                 }
             if r.status_code == 429:
@@ -164,13 +171,14 @@ async def get_directional_bias() -> str:
 
 @mcp.tool()
 async def get_signal_history(limit: int = 20) -> str:
-    """The public audit trail: recent calls and what Bitcoin did next.
+    """Recent calls and what Bitcoin did next (Pro tier).
 
     Each record carries timestamp, side, confidence, regime, zone, reason,
     plus outcomes where resolved (+4h/+24h returns, worst drawdown). Use
-    this to verify rather than trust: the entire record is public, and
-    auditing it is the intended use. Nothing is withheld and outcomes are
-    never re-scored after the fact.
+    this to verify rather than trust: outcomes are never re-scored after
+    the fact. The keyless public track record lives at the website's
+    track-record page (also reachable via get_rejection_funnel's sibling
+    REST endpoint /api/v2/signals/track-record).
 
     Args:
         limit: Number of recent signals to return (1–200, default 20)
@@ -201,7 +209,7 @@ async def get_regime_current() -> str:
 
 @mcp.tool()
 async def get_fee_histogram() -> str:
-    """Who is transacting on-chain right now — X-Ray's raw read (Pro).
+    """Who is transacting on-chain right now — X-Ray's raw read (free key).
 
     The mempool fee curve shape: FLAT_WIDE means patient accumulation,
     STEEP_TALL means urgency or panic, BIMODAL means whale activity.
@@ -223,7 +231,7 @@ async def get_fee_histogram() -> str:
 
 @mcp.tool()
 async def get_funding_divergence() -> str:
-    """Is positioning one-sided enough to squeeze? (Pro stream)
+    """Is positioning one-sided enough to squeeze? (free key)
 
     Cross-exchange funding spread, velocity, and squeeze probability.
     Contrarian by design: the market usually reverses against the crowded
@@ -289,7 +297,7 @@ async def get_gamma_exposure() -> str:
 
 @mcp.tool()
 async def get_dashboard() -> str:
-    """The full picture in one call (Pro). Use the individual tools when
+    """The full picture in one call (free key). Use the individual tools when
     you want one answer cheaply; use this when you want everything at once.
 
     Bundle: regime + signal + funding + suppressed signals.
@@ -332,6 +340,34 @@ async def get_system_counters() -> str:
         - days_collecting: How many days the system has been running
     """
     return _fmt(await _get("/api/v2/system/counters"))
+
+
+@mcp.tool()
+async def get_rejection_funnel(day: str = "", days: int = 0,
+                               since: str = "") -> str:
+    """Why no signal? The pipeline funnel in one glance (public).
+
+    Every cycle that does not become a signal died at a specific gate. This
+    returns the cycle count at each gate in order, so your agent can draw a
+    survival funnel and see where reads are being rejected — the direct
+    answer to "BRS rejects almost everything, prove it."
+
+    Args:
+        day: A specific UTC day (YYYY-MM-DD). Empty = today.
+        days: Sum over the last N UTC days (e.g. 30). Ignored if day set.
+        since: "launch" for every day on record, or a YYYY-MM-DD start date.
+
+    Returns:
+        cycles_total, emitted, signals_sent, per-gate counts, gate_order.
+    """
+    params = ""
+    if day:
+        params = f"?day={day}"
+    elif days:
+        params = f"?days={days}"
+    elif since:
+        params = f"?since={since}"
+    return _fmt(await _get(f"/api/v2/health/funnel{params}"))
 
 
 # ═══════════════════════════════════════════════════════════════════

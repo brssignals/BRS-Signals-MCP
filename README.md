@@ -88,7 +88,7 @@ it and let it reach its own conclusion:
 ```
 "BRS Signals claims it rejects almost every read. Pull its public track
 record (get_signal_history) and today's rejection funnel
-(GET /api/v2/health/funnel), and tell me: does the data support the claim,
+(get_rejection_funnel), and tell me: does the data support the claim,
 and what happened after each call at +4h and +24h?"
 ```
 
@@ -96,26 +96,59 @@ and what happened after each call at +4h and +24h?"
 
 Three independent sensors running every 30 seconds, fused into one convergence score:
 
-| Sensor | Data Source | What It Detects |
-|--------|------------|-----------------|
-| **X-Ray** | On-chain mempool fee curves | FLAT_WIDE (accumulation) vs STEEP_TALL (panic) |
-| **Pulse** | Cross-exchange funding velocity | Squeeze probability + direction |
-| **Shadow** | Stablecoin whale flows (Tron + Solana) | Buying/selling intent before price moves |
+| Sensor | Domain | What It Detects |
+|--------|--------|-----------------|
+| **X-Ray** | On-chain | Bitcoin's internal structure — fee curves, capital movement, network health |
+| **Pulse** | Off-chain | Derivatives positioning and macro — funding velocity, whale flows, squeeze probability |
+| **Shadow** | Absence | What has *stopped* happening — the silence when a normally busy channel goes quiet |
 
 When all three agree → conviction. When they disagree → silence.
 
 ## MCP Tools
 
+**16 tools.** What each tier can call:
+
+| Tool | Keyless | Free key | Pro |
+|------|:---:|:---:|:---:|
+| `get_convergence` | ✅ | ✅ | ✅ |
+| `get_regime_current` | ✅ | ✅ | ✅ |
+| `get_system_health` | ✅ | ✅ | ✅ |
+| `get_system_counters` | ✅ | ✅ | ✅ |
+| `get_rejection_funnel` | ✅ | ✅ | ✅ |
+| `get_fee_histogram` | — | ✅ | ✅ |
+| `get_funding_divergence` | — | ✅ | ✅ |
+| `get_dashboard` | — | ✅ | ✅ |
+| `get_directional_bias` | — | — | ✅ |
+| `get_signal_history` | — | — | ✅ |
+| `get_stablecoin_flows` | — | — | ✅ |
+| `get_gamma_exposure` | — | — | ✅ |
+
+**No BRS API** — `query_db` (read-only SQLite on the server) and the three
+`get_mempool_*` / `get_block_tip` tools (live mempool.space) need no key.
+
+**Regime & direction**
 - `get_convergence` — All three engine verdicts + convergence score
-- `get_directional_bias` — bullish/bearish/WAIT with confidence
-- `get_signal_history` — Recent decoder decisions
 - `get_regime_current` — Market regime + active events
-- `get_fee_histogram` — Mempool fee curve shape analysis
-- `get_funding_divergence` — Cross-exchange funding squeeze
-- `get_stablecoin_flows` — Whale stablecoin transfers
-- `get_gamma_exposure` — Dealer gamma + flip level
-- `get_dashboard` — Bundled regime + signal + funding
-- `get_system_health` — Quick health check
+- `get_directional_bias` — bullish/bearish/WAIT with confidence (Pro)
+- `get_signal_history` — Recent decisions (Pro)
+
+**Underlying streams**
+- `get_fee_histogram` — Mempool fee curve shape analysis (free key)
+- `get_funding_divergence` — Cross-exchange funding squeeze (free key)
+- `get_stablecoin_flows` — Whale stablecoin transfers (Pro)
+- `get_gamma_exposure` — Dealer gamma + flip level (Pro)
+- `get_dashboard` — Bundled regime + signal + funding (free key)
+
+**System & audit**
+- `get_system_health` — Component-by-component health check
+- `get_system_counters` — Signals sent, data points, days collecting
+- `get_rejection_funnel` — Per-gate cycle counts: why no signal
+- `query_db` — Read-only SQL against the BRS database
+
+**Bitcoin network · live** (mempool.space)
+- `get_mempool_fees` — Recommended fee rates (sat/vB)
+- `get_mempool_stats` — Pending tx count, vsize, total fees
+- `get_block_tip` — Current block height
 
 ## Pricing
 
