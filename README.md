@@ -155,7 +155,7 @@ When all three agree → conviction. When they disagree → silence.
 - **Free tier** — Regime classification + convergence score (5 req/min). No card.
 - **Pro tier ($50/mo)** — Full directional bias + raw streams + unlimited requests
 - **Per-call ($0.01/query)** — Pro bias, pay-as-you-go via x402 (USDC on
-  Solana): hit `/api/v2/bias/per-call`, pay the 402, retry with
+  Solana or Base): hit `/api/v2/bias/per-call`, pay the 402, retry with
   `?tx_signature=` + your free key. Capped at $50 per rolling 30 days, then
   converts to Pro — never more than $50 in any 30 days. Solana + Base.
 - **x402** — Agents with wallets pay per access in USDC; no signup, no human

@@ -324,10 +324,9 @@ Returns: `block_height`.
 **Free tier** shows outputs only — convergence score, regime classification, track record. No raw collector data (fee curves, funding, stablecoins hidden). Delay: 5 minutes. Rate: 5 req/min. Proves the Three Eyes are real without exposing the secret sauce.
 
 **Per-call** — the Pro bias one query at a time: `GET /api/v2/bias/per-call`
-returns a 402 with an exact $0.01 USDC settlement (Solana); pay it, retry with
-`?tx_signature=` + your free key. Capped at $50 per rolling 30 days and
-converts to Pro at the cap — never more than $50 in any 30 days. Solana now,
-Base next.
+returns a 402 with an exact $0.01 USDC settlement (Solana or Base); pay it,
+retry with `?tx_signature=` + your free key. Capped at $50 per rolling 30 days
+and converts to Pro at the cap — never more than $50 in any 30 days.
 
 **Pro tier** unlocks everything: real-time raw streams, directional bias, full history, unlimited requests.
 

@@ -102,7 +102,7 @@ async def _get(endpoint: str, timeout: float = 15.0) -> dict:
                     "pro_required": True,
                     "amount": "$50/month (Pro tier)",
                     "how_to_pay": (
-                        "Send USDC via Solana Pay or sign up at "
+                        "Send USDC on Solana or Base (via x402) or sign up at "
                         "https://brs-signals.com"
                     ),
                     "upgrade_url": "https://brs-signals.com/signup",
