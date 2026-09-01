@@ -61,9 +61,12 @@ _ALLOWED_HOSTS = [
 
 mcp = FastMCP(
     "brs-signals",
-    instructions="₿RS Signals — Bitcoin regime-switch detection before price moves. "
-    "Three Eyes architecture: on-chain (fee curves), off-chain (funding divergence), "
-    "and absence detection (shadow). Real-time bullish/bearish/WAIT signals for AI agents.",
+    instructions="₿RS Signals — pre-price, three-eye Bitcoin signals. "
+    "Three independent sensors read pre-price flows (mempool fee-curve shape, "
+    "funding velocity, whale flows) every 30s and reject almost everything. "
+    "Only when all three converge does a bullish/bearish/WAIT call come out, "
+    "with evidence attached. The gate-by-gate rejection funnel is public — so "
+    "you can audit the silence, not just the signals.",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=_ALLOWED_HOSTS,
@@ -580,7 +583,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="₿RS Signals MCP Server — Bitcoin regime-switch detection for AI agents",
+        description="₿RS Signals MCP Server — pre-price, three-eye Bitcoin signals for AI agents",
     )
     parser.add_argument(
         "--transport",
