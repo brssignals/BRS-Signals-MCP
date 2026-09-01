@@ -6,8 +6,10 @@ Live Bitcoin market regime for AI agents: three independent sensors read
 pre-price data — fee curves, funding velocity, whale flows, absence — every
 30s and reject almost everything. When they converge, you get a directional
 call with the evidence attached. The data doesn't exist in history; it exists
-right now and can't be reconstructed. Public track record your agent can
-audit in one call. MCP + REST + x402. Free tier, no card.
+right now and can't be reconstructed. **Provable silence:** the public
+rejection funnel shows exactly how many reads died at each gate, so your
+agent can audit the silence, not just the signals. MCP + REST + x402. Free
+tier, no card.
 
 ## Use it in 30 seconds — remote, no install
 
