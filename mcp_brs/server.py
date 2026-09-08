@@ -377,6 +377,13 @@ SCHEMA_VERSION = "1.0"
 METHODOLOGY_VERSION = "2026.09"
 DISCLAIMER = "Market-structure context; not an execution instruction."
 
+# BRS-021d — Freshness. A LIVE reading is valid for _VALID_FOR_SECONDS after its
+# observation instant (`as_of`). `freshness_seconds` = now - `as_of`; once it
+# exceeds `valid_for_seconds` the envelope `status` becomes "stale". Ledger /
+# aggregate tools (history, track-record, funnel, counters) carry no observation
+# instant and report request-time `as_of` with `freshness_seconds` 0.
+_VALID_FOR_SECONDS = 90
+
 
 class ErrorInfo(BaseModel):
     """Structured error carried inside the envelope (audit §4.3 / BRS-012).
@@ -445,7 +452,7 @@ class ResultEnvelope(BaseModel):
     methodology_version: str = METHODOLOGY_VERSION
     as_of: str
     freshness_seconds: int = 0
-    valid_for_seconds: int = 90
+    valid_for_seconds: int = _VALID_FOR_SECONDS
     status: Literal["ok", "degraded", "stale", "unavailable", "error"]
     tier: str = "free"
     data: Optional[dict[str, Any]] = None
@@ -464,6 +471,80 @@ def _iso_now() -> str:
 def _new_request_id() -> str:
     """Short, unique, non-sensitive correlation id for one envelope."""
     return f"brs_{uuid.uuid4().hex[:12]}"
+
+
+# ── Freshness derivation (BRS-021d) ─────────────────────────────────
+# `as_of` must be the UNDERLYING OBSERVATION time, not the request time. A
+# stalled source (its observation timestamp stops advancing) therefore makes
+# `freshness_seconds` grow and flips `status` to "stale". Tools whose upstream
+# carries no observation instant (ledgers/aggregates) are excluded below.
+
+def _parse_observation(value: Any) -> Optional[datetime]:
+    """Parse an observation timestamp into an aware UTC datetime, or None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        try:
+            dt = datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    elif isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _observation_of(payload: Any) -> Optional[datetime]:
+    """The observation instant of a LIVE reading, or None when the tool carries
+    no observation concept (ledgers/aggregates). Only top-level observation
+    keys are considered — list tools' per-record timestamps (signals[],
+    history[]) are historical evidence, not a freshness signal."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("as_of", "timestamp", "observed_at"):
+        ts = _parse_observation(payload.get(key))
+        if ts is not None:
+            return ts
+    latest = payload.get("latest_event")
+    if isinstance(latest, dict):
+        return _parse_observation(latest.get("timestamp"))
+    return None
+
+
+def _oldest_observation(observations: list[Optional[datetime]]) -> Optional[datetime]:
+    """Oldest non-None observation — a bundle is as fresh as its stalest part."""
+    present = [o for o in observations if o is not None]
+    return min(present) if present else None
+
+
+def _iso_of(dt: datetime) -> str:
+    """ISO-8601 Z-suffix string for an aware datetime (second precision)."""
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _freshness(observation: Optional[datetime], now: datetime) -> tuple[str, int]:
+    """(status, freshness_seconds) for an observation instant vs `now`.
+
+    No observation instant -> ("ok", 0): the tool class carries no freshness
+    concept. A present-but-too-old instant -> ("stale", age)."""
+    if observation is None:
+        return "ok", 0
+    age = (now - observation).total_seconds()
+    freshness = max(0, int(age))
+    if age > _VALID_FOR_SECONDS:
+        return "stale", freshness
+    return "ok", freshness
 
 
 # ── Error model (audit §4.3 / BRS-012) ──────────────────────────────
@@ -607,12 +688,23 @@ def _error_envelope(code: str, message: str, tier: str = "free",
     )
 
 
-def _envelope(payload: dict[str, Any], tier: str = "free") -> ResultEnvelope:
-    """Wrap an upstream read in the standard envelope.
+def _envelope(payload: dict[str, Any], tier: str = "free",
+              observation: Any = None, unavailable: bool = False,
+              quality: Optional[QualityInfo] = None) -> ResultEnvelope:
+    """Wrap an upstream read in the standard envelope (BRS-021d freshness).
 
-    Detects upstream/local error dicts (presence of an "error" key) and marks
-    the envelope `status="error"` with a typed `error` payload, so success and
-    failure both honor one shape.
+    Error path: an upstream/local error dict becomes `status="error"` with a
+    typed `error` payload, so success and failure both honor one shape.
+
+    Success path now derives freshness: `as_of` is the upstream OBSERVATION
+    instant (``observation`` or the payload's own timestamp — never the request
+    time), `freshness_seconds` is its age, and `status` becomes "stale" once
+    the reading is older than `valid_for_seconds`. A tool with no observation
+    instant reports request-time `as_of` with `freshness_seconds` 0.
+
+    ``unavailable=True`` marks INSUFFICIENT DATA to evaluate (abstention — the
+    upstream's "no decisions yet"), a legitimate non-error state that is
+    distinct from a successfully computed WAIT (which stays "ok").
     """
     if isinstance(payload, dict) and payload.get("error"):
         return _error_envelope(
@@ -623,11 +715,21 @@ def _envelope(payload: dict[str, Any], tier: str = "free") -> ResultEnvelope:
             how_to_fix=payload.get("how_to_fix"),
             payment=payload.get("payment"),
         )
+    now = datetime.now(timezone.utc)
+    obs = _parse_observation(observation) if observation is not None else _observation_of(payload)
+    if unavailable:
+        status = "unavailable"
+        freshness = _freshness(obs, now)[1] if obs is not None else 0
+    else:
+        status, freshness = _freshness(obs, now)
     return ResultEnvelope(
-        as_of=_iso_now(),
-        status="ok",
+        as_of=_iso_of(obs) if obs is not None else _iso_now(),
+        freshness_seconds=freshness,
+        valid_for_seconds=_VALID_FOR_SECONDS,
+        status=status,
         tier=tier,
         data=payload,
+        quality=quality,
         request_id=_new_request_id(),
     )
 
@@ -658,11 +760,25 @@ async def brs_market_state() -> ResultEnvelope:
     for part in (structure, convergence, health):
         if isinstance(part, dict) and part.get("error"):
             return _envelope(part)
-    return _envelope({
-        "market_structure": structure,
-        "convergence": convergence,
-        "system_health": health,
-    })
+    # Bundle freshness: as fresh as its STALEST observed part. Components with
+    # no observation instant (e.g. confidence verdicts) simply don't age the
+    # bundle; a stalled observed part does.
+    now = datetime.now(timezone.utc)
+    observations = [_observation_of(p) for p in (structure, convergence, health)]
+    oldest = _oldest_observation(observations)
+    healthy = sum(
+        1 for o in observations
+        if o is not None and (now - o).total_seconds() <= _VALID_FOR_SECONDS
+    )
+    return _envelope(
+        {
+            "market_structure": structure,
+            "convergence": convergence,
+            "system_health": health,
+        },
+        observation=oldest,
+        quality=QualityInfo(sources_expected=3, sources_healthy=healthy),
+    )
 
 
 @mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_PRO_TIER_META)
@@ -698,8 +814,16 @@ async def brs_decision_context(
         chain: Rail you paid on — "solana" or "base". Default "solana".
         ref: Optional attribution tag carried through to the payment ledger.
     """
-    return _envelope(await _get(_per_call_endpoint(tx_signature, chain, ref)),
-                     tier="pro")
+    payload = await _get(_per_call_endpoint(tx_signature, chain, ref))
+    # Abstention vs inability (BRS-021d): "no decisions yet" is INSUFFICIENT
+    # DATA (status "unavailable"), not a computed WAIT — so an agent can tell
+    # "edge not evaluated" apart from "evaluated, no edge".
+    unavailable = (
+        isinstance(payload, dict)
+        and not payload.get("error")
+        and payload.get("reason") == "no decisions yet"
+    )
+    return _envelope(payload, tier="pro", unavailable=unavailable)
 
 
 @mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_PRO_TIER_META)
@@ -786,11 +910,13 @@ async def brs_system_status() -> ResultEnvelope:
     Bundles two keyless reads plus a measured SLO block:
       - component health: collector/engine status and last-good timestamps
       - system counters: signals sent, data points collected, days collecting
-      - slo: status, measured latency_ms, boot-epoch uptime, and the
-        configured registry compliance_pct — scope is "registry metadata
-        checks" only (see compliance_note); it is NOT protocol conformance
-        (BRS-021f: this v1 server serves up to 2025-11-25) and NOT
-        operational health (the measured fields above)
+      - slo: status; CONFIGURED (compliance_pct + scope note) vs MEASURED
+        (uptime_24h_pct, boot-epoch uptime, latency_ms) kept apart; an
+        observation_window discloses the 24h coverage and flags insufficient
+        history explicitly. compliance_pct scope is "registry metadata checks"
+        only (see compliance_note) — NOT protocol conformance (BRS-021f: this
+        v1 server serves up to 2025-11-25) and NOT operational health (the
+        measured fields above)
 
     Call this when any reading looks stale or absent, and to see exactly how
     small the sample behind a claim is. Small samples cannot prove an edge.
@@ -811,21 +937,37 @@ async def brs_system_status() -> ResultEnvelope:
     from mcp_brs import metadata as _metadata
 
     uptime = (health or {}).get("slo") or {}
+    # BRS-021d — separate CONFIGURED targets (promises) from MEASURED results
+    # (observations), and disclose the observation window + coverage with an
+    # explicit insufficient_history flag. An uptime % is never fabricated: a
+    # window the current boot cannot cover reads None + insufficient_history.
     slo = {
         "status": uptime.get("status") or _metadata.REGISTRY_STATUS,
         "status_detail": uptime.get("status_detail"),
-        "uptime_24h_pct": uptime.get("uptime_24h_pct"),
-        "uptime_note": uptime.get("uptime_note"),
-        "uptime_seconds": uptime.get("uptime_seconds"),
-        "boot_epoch": uptime.get("boot_epoch"),
-        "compliance_pct": _metadata.COMPLIANCE_PCT,
-        "compliance_note": "registry metadata checks (BRS-014): server-card/"
-                           "glama.json/mcpb manifest generated from canonical "
-                           "metadata, CI drift-check green. NOT protocol "
-                           "conformance (serves <= 2025-11-25 — BRS-021f) and "
-                           "NOT operational health (see measured fields above)",
-        "latency_ms": latency_ms,
-        "measured_at": _iso_now(),
+        "configured": {
+            "compliance_pct": _metadata.COMPLIANCE_PCT,
+            "compliance_note": "registry metadata checks (BRS-014): server-card/"
+                               "glama.json/mcpb manifest generated from canonical "
+                               "metadata, CI drift-check green. NOT protocol "
+                               "conformance (serves <= 2025-11-25 — BRS-021f) and "
+                               "NOT operational health (see measured below)",
+        },
+        "measured": {
+            "uptime_24h_pct": uptime.get("uptime_24h_pct"),
+            "uptime_note": uptime.get("uptime_note"),
+            "uptime_seconds": uptime.get("uptime_seconds"),
+            "boot_epoch": uptime.get("boot_epoch"),
+            "api_serving": uptime.get("api_serving"),
+            "live_loop_ok": uptime.get("live_loop_ok"),
+            "signal_loop_age_seconds": uptime.get("signal_loop_age_seconds"),
+            "latency_ms": latency_ms,
+            "measured_at": _iso_now(),
+        },
+        "observation_window": {
+            "uptime_window_hours": 24,
+            "covered": uptime.get("uptime_24h_pct") is not None,
+            "insufficient_history": uptime.get("uptime_24h_pct") is None,
+        },
     }
     return _envelope({"health": health, "counters": counters, "slo": slo})
 

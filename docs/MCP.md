@@ -181,21 +181,41 @@ over last N UTC days), `since` (`"launch"` or a YYYY-MM-DD).
 | `counters` | Signals sent, data points collected, days collecting |
 | `slo` | Status, measured `latency_ms`, and registry SLO fields |
 
-The `slo` block (BRS-019) is what registry listings report:
+The `slo` block (BRS-019/BRS-021d) is what registry listings report. It keeps
+**configured targets** (promises) apart from **measured results** (observations):
 
 | `slo.*` | Description |
 |---------|-------------|
 | `status` | `active` / `degraded` / `unavailable` |
 | `status_detail` | Why — always names the stale/unhealthy part |
-| `uptime_24h_pct` | `100.0` only when the current boot covers the full window |
-| `uptime_note` | States the boot-epoch convention (`None` ≠ 100 after a restart) |
-| `boot_epoch` | ISO start of the process's current life |
-| `compliance_pct` | 100 — generated from canonical metadata (drift-checked) |
-| `latency_ms` | Measured round-trip of this call |
-| `measured_at` | ISO timestamp of this measurement |
+| `configured.compliance_pct` | 100 — generated from canonical metadata (drift-checked) |
+| `configured.compliance_note` | **Scope of that %**: registry metadata checks only — NOT protocol conformance, NOT operational health |
+| `measured.uptime_24h_pct` | `100.0` only when the current boot covers the full window |
+| `measured.uptime_note` | States the boot-epoch convention (`None` ≠ 100 after a restart) |
+| `measured.boot_epoch` | ISO start of the process's current life |
+| `measured.uptime_seconds` | Seconds of the current boot |
+| `measured.latency_ms` | Measured round-trip of this call |
+| `measured.measured_at` | ISO timestamp of this measurement |
+| `observation_window.uptime_window_hours` | 24 — the window the uptime % covers |
+| `observation_window.covered` | `true` when the boot + loop cover that window |
+| `observation_window.insufficient_history` | `true` when uptime is `None` (never fabricated) |
 
 Call this when any reading looks stale, and to see exactly how small the sample
 behind a claim is. Small samples cannot prove an edge.
+
+### Freshness & expiry (every envelope)
+
+Every result carries `as_of`, `freshness_seconds`, `valid_for_seconds`, and
+`status`. `as_of` is the **underlying observation time** — not the request time.
+`freshness_seconds` = `now − as_of`; once it exceeds `valid_for_seconds` (90 s)
+the `status` flips `stale`. A stalled data source therefore ages a reading and
+eventually reports `stale` or `unavailable`, so an agent can tell "old data"
+apart from "quiet market". Ledger/aggregate tools (`brs_history`,
+`brs_audit_track_record`, `brs_rejection_funnel`, `brs_system_status` counters)
+carry no observation instant and report request-time `as_of` with
+`freshness_seconds` 0. `unavailable` means **insufficient data to evaluate**
+(e.g. the decoder's "no decisions yet"), distinct from a successfully computed
+`WAIT`, which stays `ok`.
 
 **Use when:** Verifying the API is operational before relying on its readings.
 
