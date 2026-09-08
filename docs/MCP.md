@@ -7,15 +7,36 @@
 
 ## What Is This?
 
-The BRS Signals MCP server exposes **11 tools** to any MCP-compatible client (Claude Desktop, Cursor, Continue, etc.). Each tool wraps a live BRS Signals API endpoint, giving AI agents access to:
+The BRS Signals MCP server exposes **7 tools** to any MCP-compatible client
+(Claude Desktop, Cursor, Continue, etc.). Each tool wraps a live BRS Signals
+API endpoint.
 
 | Layer | What It Sees | Data Sources |
 |-------|-------------|-------------|
 | **Inner Eye (X-Ray)** | On-chain behavior | Mempool fee curves, miner flows, exchange reserves |
-| **Outer Eye (SolarRay)** | Off-chain context | Funding divergence, ETF flows, macro correlations |
+| **Outer Eye (SolarRay)** | Off-chain context | Funding divergence, whale flows, macro correlations |
 | **Invisible Eye (Shadow)** | Absence detection | Volume drops, volatility compression, silent accumulation |
 
-These three independent engines converge into a **single directional bias** (bullish/bearish/WAIT) — verified at **>80% directional accuracy** on a public track record.
+These three independent engines converge into a **single directional posture**
+(bullish / bearish / WAIT) — the most common answer is **WAIT**, because the
+system rejects almost every read. The gate-by-gate rejection funnel and the
+full track record are public, so agents can audit the silence rather than take
+the claim on faith.
+
+---
+
+## Don't trust us — query us
+
+Before you trust a single signal, verify the system with two **keyless** tools:
+
+```
+"BRS Signals claims it rejects almost every read. Pull its public track
+record (brs_audit_track_record) and today's rejection funnel
+(brs_rejection_funnel), and tell me: does the data support the claim,
+and what happened after each call at +4h and +24h?"
+```
+
+No API key, no payment, no signup. The honesty surface is open by design.
 
 ---
 
@@ -26,7 +47,7 @@ These three independent engines converge into a **single directional bias** (bul
 ### 1. Install
 
 ```bash
-# From PyPI (once published):
+# From PyPI:
 pip install brs-signals-mcp
 
 # Or from source:
@@ -41,18 +62,30 @@ pip install -e ".[mcp]"
 # stdio transport (Claude Desktop, Cursor, Continue)
 python -m mcp_brs
 
-# SSE/HTTP transport (remote agents, teams, self-hosting)
-python -m mcp_brs --transport sse --port 8080
-
-# With API key (Pro tier)
+# With API key (unlocks the full 7-tool surface)
 BRS_API_KEY=va_yourkey_here python -m mcp_brs
 
 # Or via the installed script entry point:
 brs-mcp
-brs-mcp --transport sse --port 8080
 ```
 
+For remote use, do not self-host — point your client at the public
+streamable-http endpoint `https://brs-signals.com/mcp` (see below).
+
 ### 3. Configure Your MCP Client
+
+**Remote (streamable-http) — zero install, keyless free tier:**
+
+```json
+{
+  "mcpServers": {
+    "brs-signals": {
+      "type": "http",
+      "url": "https://brs-signals.com/mcp"
+    }
+  }
+}
+```
 
 **Local (stdio) — Claude Desktop, Cursor, Continue:**
 
@@ -61,23 +94,10 @@ brs-mcp --transport sse --port 8080
   "mcpServers": {
     "brs-signals": {
       "command": "python3",
-      "args": ["mcp_brs/server.py"],
-      "cwd": "/path/to/4.BRS-Signals",
+      "args": ["-m", "mcp_brs"],
       "env": {
         "BRS_API_KEY": "va_yourkey_here"
       }
-    }
-  }
-}
-```
-
-**Remote (SSE) — any MCP client over HTTP:**
-
-```json
-{
-  "mcpServers": {
-    "brs-signals": {
-      "url": "http://your-server:8080/sse"
     }
   }
 }
@@ -92,215 +112,146 @@ Continue → `~/.continue/config.json`
 
 ## Tools Reference
 
-### Three Eyes Architecture (Primary)
-
-#### `get_convergence`
-**Get the full Three Eyes convergence picture.**
-
-Returns all three engine verdicts (X-Ray, SolarRay, Shadow), the convergence score (0.0–1.0), which meta-regime is dominant, whether a regime shift is brewing, gamma exposure data, and the system-wide entropy gradient.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `xray` | object | Inner Eye verdict — on-chain regime assessment |
-| `solarray` | object | Outer Eye verdict — off-chain context |
-| `shadow` | object | Invisible Eye verdict — absence/anomaly detection |
-| `convergence_score` | float | 0.0–1.0: how much the three engines agree |
-| `shift_brewing` | bool | `true` if entropy is rising → regime change may be imminent |
-| `entropy_gradient` | float | Rate of entropy change across all streams |
-| `gamma` | object | Dealer gamma exposure + flip level |
-
-**Use when:** You need the full market structure before making any directional decision.
-
----
-
-#### `get_directional_bias`
-**Get the current directional bias (bullish/bearish/WAIT) with confidence.**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `side` | string | `bullish`, `bearish`, or `WAIT` |
-| `confidence` | float | Adjusted confidence 0–100% |
-| `raw_conviction` | float | Raw conviction before regime adjustment |
-| `regime` | string | Meta-regime the signal was generated in |
-| `zone` | string | Price zone: `low`, `mid`, or `high` |
-| `reason` | string | Human-readable explanation |
-| `suppressed` | bool | `true` if filtered by noise detector |
-| `btc_price` | float | BTC price when signal was generated |
-| `timestamp` | string | ISO 8601 timestamp |
-
-> ⚠️ **WAIT means NO EDGE.** Do not force a trade when the system says WAIT.
-> Suppressed signals were caught by the noise filter — ignore them.
-
-**Use when:** You need a straightforward BUY/SELL/WAIT answer for BTC.
-
----
-
-#### `get_signal_history`
-**Get recent decoder decisions with ZLMA filtering.**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `limit` | int | 20 | Number of signals (1–200) |
-
-Returns a list of past signals, each with: `timestamp`, `side`, `confidence`, `regime`, `zone`, `reason`, `suppressed`, `btc_price`.
-
-**Use when:** You want to see the signal track record or analyze patterns over time.
-
----
-
-### Regime Detection
-
-#### `get_regime_current`
-**Get the current Bitcoin market regime with conviction.**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `latest_event` | object | Most recent regime event |
-| `latest_event.event_type` | string | `ACCUMULATION`, `DISTRIBUTION`, `SQUEEZE_IMMINENT`, etc. |
-| `latest_event.conviction` | float | How confident the detector is (0.0–1.0) |
-| `latest_event.direction` | string | `BULLISH`, `BEARISH`, `NEUTRAL` |
-| `active_events` | object | All currently active regime events |
-
-**Use when:** You need the broader market phase before interpreting individual signals.
-
----
-
-### On-Chain Data Sources
-
-#### `get_fee_histogram`
-**Get the mempool fee curve shape and statistics.**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `curve_type` | string | `FLAT_WIDE` (accumulation), `STEEP_TALL` (panic), `BIMODAL` (whale activity) |
-| `actor_profile` | string | Inferred actor behavior from fee distribution |
-| `skewness` | float | Statistical skew of fee distribution |
-| `kurtosis` | float | "Peakedness" of fee distribution |
-| `gini_coefficient` | float | Fee spending inequality (low = uniform, high = whales dominating) |
-| `entropy` | float | Diversity of fee usage (high = diverse, low = single-actor) |
-| `tx_count` | int | Number of transactions analyzed |
-
-> **FLAT_WIDE** = whales being patient (accumulation).  
-> **STEEP_TALL** = retail rushing transactions (panic/FOMO).
-
-**Use when:** You want to detect whale vs. retail behavior in the mempool.
-
----
-
-#### `get_funding_divergence`
-**Get cross-exchange funding rate divergence and squeeze probability.**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `squeeze_probability` | float | 0–100% chance of a funding squeeze |
-| `divergence_direction` | string | `BULLISH`, `BEARISH`, or `NONE` |
-| `max_spread` | float | Max spread between exchange funding rates |
-| `spread_velocity` | float | How fast the spread is growing (%/min) |
-| `binance_rate` | float | Binance funding rate |
-| `bybit_rate` | float | Bybit funding rate |
-| `okx_rate` | float | OKX funding rate |
-| `hyperliquid_rate` | float | Hyperliquid funding rate |
-
-> **High squeeze probability** = traders piling onto one side → the market usually reverses against them. This is a contrarian signal.
-
-**Use when:** You want to gauge crowd positioning for contrarian entries.
-
----
-
-#### `get_stablecoin_flows`
-**Get stablecoin whale transfer flows (USDT on Tron, USDC on Solana).**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `flow_regime` | string | `NORMAL`, `INFLOW_SURGE` (buying), `OUTFLOW_SURGE` (selling) |
-| `total_net` | float | Net stablecoin flow (positive = accumulating) |
-
-> Whale stablecoin flows detect intent BEFORE it reaches exchanges.  
-> Large USDT inflows to exchange wallets = imminent buying pressure.
-
-**Use when:** You want to see what whales are doing before they move markets.
-
----
-
-#### `get_gamma_exposure`
-**Get dealer gamma exposure and gamma flip level.**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `dealer_net_gamma` | float | Net dealer gamma position |
-| `gamma_flip_level` | float | Price where gamma flips (key S/R) |
-| `put_gamma` | float | Put gamma |
-| `call_gamma` | float | Call gamma |
-| `gamma_regime` | string | Gamma regime interpretation |
-
-> **Gamma flip levels act as magnetic price levels.** Above flip = dealers accelerate trends. Below flip = dealers dampen them. Large negative gamma = explosive potential.
-
-**Use when:** You want key price levels from the options market.
-
----
-
-### Dashboard & System
-
-#### `get_dashboard`
-**Get the full dashboard bundle in one call.**
-
-Returns: `regime_meta`, `signal`, `funding`, `suppressed` signals, `cycle_context`, `options_context`.
-
-**Use when:** You want everything in a single API call. This is the most comprehensive endpoint.
-
----
-
-#### `get_system_health`
-**Quick health check of the BRS Signals system.**
-
-Returns component-by-component status (`ok`/`error`) for all data collectors and engines.
-
-**Use when:** You want to verify the API is operational before relying on its signals.
-
----
-
-#### `get_system_counters`
-**Get live data counters.**
-
-Returns: `signals_fired` (total), `data_points` (total), `days_collecting`.
-
-**Use when:** You want to know how much data the system has processed.
-
----
-
-#### `query_db`
-**Run a read-only SQL query against the BRS database.**
-
-Tables: `decoder_decision_records`, `engine_verdict_records`, `regime_event_records`, `vao_records`, `funding_records`, etc.
-
-Args: `query` (SQL SELECT statement). Capped at 100 rows.
-
-**Use when:** You need signal history, regime state, or system health without spawning sqlite3 CLI.
-
----
-
-#### `get_mempool_fees`
-**Live Bitcoin mempool fee rates from mempool.space.**
-
-Returns: `fastestFee`, `halfHourFee`, `economyFee`, `minimumFee` (all in sat/vB).
-
-**Use when:** Verifying X-Ray sensor readings against live on-chain fee data.
-
----
-
-#### `get_mempool_stats`
-**Live mempool stats: pending tx count, total size, total fees.**
-
-Returns: `pending_tx`, `total_vsize`, `total_fee_btc`.
-
-**Use when:** Checking on-chain congestion level.
-
----
-
-#### `get_block_tip`
-**Current Bitcoin block height from mempool.space.**
-
-Returns: `block_height`.
+Discovery is **authorization-scoped** (BRS-013): keyless callers see only the
+4 Free tools; a caller presenting a key sees all 7. The upstream API still
+enforces Pro on call — no Pro tool is callable keyless.
+
+### Free — no key required
+
+#### `brs_market_state`
+**The canonical current market posture. Call this FIRST.**
+
+Bundles three public, keyless reads into one call:
+
+| Field | Description |
+|-------|-------------|
+| `market_structure` | The regime — which game the market is playing |
+| `convergence` | How much the three sensors agree (0.0–1.0) |
+| `system_health` | Whether the instrument is operational |
+
+If any read is stale or a sensor is down, that changes what every other answer
+means — check health before trusting a directional read.
+
+**Use when:** You need the full market structure before making any directional
+decision.
+
+#### `brs_audit_track_record`
+**The keyless public proof — every call BRS has made and what Bitcoin did next.**
+
+| Field | Description |
+|-------|-------------|
+| `signals[]` | Past calls, most recent first |
+| `signals[].ts` | Call timestamp |
+| `signals[].dir` | `bullish` or `bearish` |
+| `signals[].price` | BTC price at call time |
+| `signals[].conf` | Confidence (0–100) |
+| `signals[].regime` | Meta-regime at call time |
+| `signals[].zone` | Price zone: `low`, `mid`, `high` |
+| `signals[].r4` / `r24` | +4h / +24h return % (when resolved) |
+| `signals[].mae` / `mfe` | Worst drawdown / best upside % |
+
+Outcomes are fixed once written and never re-scored — this is auditable
+evidence, not marketing. Parameter: `limit` (1–500, default 100).
+
+**Use when:** You need to audit the system's real silence and hit rate before
+trusting any signal.
+
+#### `brs_rejection_funnel`
+**Why no signal? The pipeline funnel in one glance.**
+
+Every cycle that does not become a signal died at a specific gate. This returns
+the cycle count at each gate in order, so an agent can draw a survival funnel
+and see where reads are rejected. Parameters: `day` (YYYY-MM-DD), `days` (sum
+over last N UTC days), `since` (`"launch"` or a YYYY-MM-DD).
+
+**Use when:** Answering "BRS rejects almost everything — prove it."
+
+#### `brs_system_status`
+**Instrument health, SLO standing, and the sample size behind every reading.**
+
+| Field | Description |
+|-------|-------------|
+| `health` | Collector/engine status and last-good timestamps |
+| `counters` | Signals sent, data points collected, days collecting |
+| `slo` | Status, measured `latency_ms`, and registry SLO fields |
+
+The `slo` block (BRS-019) is what registry listings report:
+
+| `slo.*` | Description |
+|---------|-------------|
+| `status` | `active` / `degraded` / `unavailable` |
+| `status_detail` | Why — always names the stale/unhealthy part |
+| `uptime_24h_pct` | `100.0` only when the current boot covers the full window |
+| `uptime_note` | States the boot-epoch convention (`None` ≠ 100 after a restart) |
+| `boot_epoch` | ISO start of the process's current life |
+| `compliance_pct` | 100 — generated from canonical metadata (drift-checked) |
+| `latency_ms` | Measured round-trip of this call |
+| `measured_at` | ISO timestamp of this measurement |
+
+Call this when any reading looks stale, and to see exactly how small the sample
+behind a claim is. Small samples cannot prove an edge.
+
+**Use when:** Verifying the API is operational before relying on its readings.
+
+### Pro — key or x402 required
+
+#### `brs_decision_context`
+**Directional posture (bullish / bearish / WAIT) with evidence and caveats.**
+
+| Field | Description |
+|-------|-------------|
+| `side` | `bullish`, `bearish`, or `WAIT` |
+| `confidence` | Normalised against reachable evidence (sent calls ≈ 0.30–0.50) |
+| `regime` / `zone` | The regime and price zone the read was made in |
+| `reason` | Human-readable explanation |
+| `suppressed` | `true` if filtered by the noise detector (shown, never hidden) |
+| `btc_price` | BTC price at read time |
+| `timestamp` | ISO 8601 timestamp |
+
+> **WAIT means NO EDGE.** This is context, not an instruction to trade.
+> Suppressed reads are shown (`suppressed=true`), never hidden.
+
+**Payment (x402, per-call).** This is the metered Pro posture. Parameters:
+`tx_signature` (empty on first call), `chain` (`solana` | `base`), `ref`
+(attribution). A Pro key skips payment entirely.
+
+1. Call with no `tx_signature`. If `status=error` and
+   `error.code=PAYMENT_REQUIRED`, read `error.payment`: it carries the exact
+   `amount`, `currency`, `asset`, `networks`, `recipient`, `resource`, `scheme`,
+   `max_timeout_seconds`, and `request_digest` you need to build the payment.
+2. Pay on an advertised rail (Solana or Base), then re-call with the
+   `tx_signature` (and matching `chain`/`ref`) to get the metered result.
+3. Retries are idempotent — the same `tx_signature` is never charged twice.
+   Enforce your own max-per-call / max-per-day policy against `error.payment`
+   before paying (spend cap: 3 re-calls per request).
+
+**Use when:** You need the directional posture. Free alternative:
+`brs_market_state`.
+
+#### `brs_history`
+**Recent calls and what Bitcoin did next.**
+
+Each record carries timestamp, side, confidence, regime, zone, reason, plus
+resolved outcomes where available (+4h/+24h returns, worst drawdown).
+Outcomes are fixed once written and never re-scored. Parameter: `limit`
+(1–200, default 20).
+
+**Use when:** You want to verify rather than trust — inspect the signal history.
+
+#### `brs_raw_stream`
+**Raw pre-price stream for explicit decomposition.**
+
+| `stream` value | What it returns |
+|----------------|-----------------|
+| `fees` | Mempool fee-curve shape (X-Ray's raw read) |
+| `funding` | Cross-exchange funding spread and squeeze probability |
+| `stablecoin` | Whale stablecoin transfers (USDT/USDC) |
+| `gamma` | Dealer gamma exposure and flip level |
+
+These are the ingredients behind the reads, not standalone trade signals.
+Some streams require a Pro API key.
+
+**Use when:** You want to decompose the signal into its raw inputs.
 
 ---
 
@@ -308,8 +259,19 @@ Returns: `block_height`.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `BRS_API_KEY` | No | — | Your API key (Pro/Max tier). Free tier works without one. |
+| `BRS_API_KEY` | No | — | Your API key (Pro tier). Free tier works without one. |
 | `BRS_API_URL` | No | `https://brs-signals.com` | Override API base URL (for self-hosted instances). NOTE: `api.brs-signals.com` has no DNS record (verified Aug 15) — do not use it. |
+| `BRS_MCP_TELEMETRY` | No | `1` | Set `0` to opt out of the anonymous usage feed (BRS-018). |
+| `BRS_MCP_TELEMETRY_FILE` | No | `data/telemetry/mcp_events.jsonl` | Where the append-only usage feed is written. |
+
+### Telemetry (BRS-018)
+
+Every tool call appends one JSON line to the usage feed. It records **only**
+what the marketing recap needs to track the north-star metrics — tool name,
+tier, outcome, error code, latency, and a one-way fingerprint of the caller.
+It never records your API key, a tx signature, or request content. The
+fingerprint is a truncated SHA-256, so callers are counted without being
+identified. Set `BRS_MCP_TELEMETRY=0` to disable it.
 
 ---
 
@@ -317,18 +279,21 @@ Returns: `block_height`.
 
 | Tier | Price | Rate Limit | Key Required |
 |------|-------|-----------|-------------|
-| **Free** | $0 | 5 req/min (5-min delayed) | No |
+| **Free** | $0 | 5 req/min | No |
 | **Per-call** | $0.01 / query | pay-as-you-go | Free key + `?tx_signature=` |
-| **Pro** | $60/mo · $600/yr ($50/mo) | Unlimited (real-time) | Yes |
+| **Pro** | $50/mo | 60 req/min | Yes |
 
-**Free tier** shows outputs only — convergence score, regime classification, track record. No raw collector data (fee curves, funding, stablecoins hidden). Delay: 5 minutes. Rate: 5 req/min. Proves the Three Eyes are real without exposing the secret sauce.
+**Free tier** shows outputs only — convergence score, regime classification,
+track record, rejection funnel, system status. No raw collector data (fee
+curves, funding, stablecoins hidden). Rate: 5 req/min.
 
-**Per-call** — the Pro bias one query at a time: `GET /api/v2/bias/per-call`
+**Per-call** — the Pro posture one query at a time: `GET /api/v2/bias/per-call`
 returns a 402 with an exact $0.01 USDC settlement (Solana or Base); pay it,
 retry with `?tx_signature=` + your free key. Capped at $50 per rolling 30 days
 and converts to Pro at the cap — never more than $50 in any 30 days.
 
-**Pro tier** unlocks everything: real-time raw streams, directional bias, full history, unlimited requests.
+**Pro tier** unlocks everything: directional posture, raw streams, full
+history, 60 req/min.
 
 Get a key at [https://brs-signals.com](https://brs-signals.com).
 
@@ -338,45 +303,43 @@ Get a key at [https://brs-signals.com](https://brs-signals.com).
 
 ```text
 ┌──────────────────────────────────────────────────────┐
-│                   MCP Client                          │
-│         (Claude Desktop / Cursor / Continue)          │
+│                   MCP Client                         │
+│         (Claude Desktop / Cursor / Continue)         │
 └──────────────────────┬───────────────────────────────┘
-                       │ stdio / JSON-RPC
+                        │ stdio / streamable-http
 ┌──────────────────────▼───────────────────────────────┐
-│              mcp_brs/server.py                        │
+│              mcp_brs/server.py                       │
 │  ┌─────────────────────────────────────────────────┐ │
-│  │  FastMCP("brs-signals")                         │ │
+│  │  _TieredFastMCP("brs-signals")                  │ │
 │  │                                                 │ │
-│  │  Tools:                                         │ │
-│  │  ├─ get_convergence()      ──┐                  │ │
-│  │  ├─ get_directional_bias() ──┤                  │ │
-│  │  ├─ get_signal_history()   ──┤                  │ │
-│  │  ├─ get_regime_current()   ──┤                  │ │
-│  │  ├─ get_fee_histogram()    ──┤  httpx.AsyncClient│ │
-│  │  ├─ get_funding_divergence()──┤      │           │ │
-│  │  ├─ get_stablecoin_flows() ──┤      │           │ │
-│  │  ├─ get_gamma_exposure()   ──┤      │           │ │
-│  │  ├─ get_dashboard()        ──┤      │           │ │
-│  │  ├─ get_system_health()    ──┤      │           │ │
-│  │  └─ get_system_counters()  ──┘      │           │ │
-│  └──────────────────────────────────────┼──────────┘ │
-└─────────────────────────────────────────┼────────────┘
-                                          │ HTTPS
-┌─────────────────────────────────────────▼────────────┐
-│              brs-signals.com                          │
+│  │  Free (keyless):                                │ │
+│  │  ├─ brs_market_state                            │ │
+│  │  ├─ brs_audit_track_record                      │ │
+│  │  ├─ brs_rejection_funnel                        │ │
+│  │  └─ brs_system_status                           │ │
+│  │  Pro (keyed / x402):                            │ │
+│  │  ├─ brs_decision_context                        │ │
+│  │  ├─ brs_history                                 │ │
+│  │  └─ brs_raw_stream                              │ │
+│  └───────────────────────┬─────────────────────────┘ │
+│                          │ pooled httpx.AsyncClient  │
+└──────────────────────────┼───────────────────────────┘
+                           │ HTTPS
+┌──────────────────────────▼───────────────────────────┐
+│              brs-signals.com                         │
 │  ┌─────────────────────────────────────────────────┐ │
 │  │  Three Eyes Architecture                        │ │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐        │ │
-│  │  │ X-Ray    │ │ SolarRay │ │ Shadow   │        │ │
-│  │  │ On-chain │ │ Off-chain│ │ Absence  │        │ │
-│  │  └────┬─────┘ └────┬─────┘ └────┬─────┘        │ │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐         │ │
+│  │  │ X-Ray    │ │ SolarRay │ │ Shadow   │         │ │
+│  │  │ On-chain │ │ Off-chain│ │ Absence  │         │ │
+│  │  └────┬─────┘ └────┬─────┘ └────┬─────┘         │ │
 │  │       └─────────────┼────────────┘              │ │
 │  │               ┌─────▼─────┐                     │ │
 │  │               │Convergence│                     │ │
 │  │               │  Scorer   │                     │ │
 │  │               └─────┬─────┘                     │ │
 │  │                     ▼                           │ │
-│  │              BUY / SELL / WAIT                  │ │
+│  │        bullish / bearish / WAIT (context)       │ │
 │  └─────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────┘
 ```
@@ -386,15 +349,16 @@ Get a key at [https://brs-signals.com](https://brs-signals.com).
 ## CLI Reference
 
 ```
-python mcp_brs/server.py [--transport {stdio,sse}] [--port PORT] [--host HOST]
+python mcp_brs/server.py [--transport {stdio,streamable-http}] [--port PORT] [--host HOST] [--require-key]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--transport stdio` | ✓ | stdio transport (local agents — Claude Desktop, Cursor) |
-| `--transport sse` | | SSE/HTTP transport (remote agents, team servers) |
-| `--port` | `8000` | Port for SSE transport |
-| `--host` | `127.0.0.1` | Bind address for SSE transport |
+| `--transport streamable-http` | | HTTP transport (remote agents, team servers) |
+| `--port` | `8000` | Port for HTTP transport |
+| `--host` | `127.0.0.1` | Bind address for HTTP transport |
+| `--require-key` | off | Fail-closed gate: require `BRS_MCP_SERVER_KEY` on every request |
 
 ---
 
@@ -402,10 +366,11 @@ python mcp_brs/server.py [--transport {stdio,sse}] [--port PORT] [--host HOST]
 
 | File | Purpose |
 |------|---------|
-| [`mcp_brs/__init__.py`](../mcp_brs/__init__.py) | Package init with exports and MCP client config docs |
+| [`mcp_brs/__init__.py`](../mcp_brs/__init__.py) | Package init with exports |
 | [`mcp_brs/__main__.py`](../mcp_brs/__main__.py) | Entry point for `python -m mcp_brs` |
-| [`mcp_brs/server.py`](../mcp_brs/server.py) | MCP server — 11 tools, ~220 lines |
-| [`requirements.txt`](../requirements.txt) | Updated with `mcp>=1.0.0` |
+| [`mcp_brs/server.py`](../mcp_brs/server.py) | MCP server — 7 canonical tools |
+| [`mcp_brs/metadata.py`](../mcp_brs/metadata.py) | Canonical product metadata (single source of truth) |
+| [`scripts/refresh_registry_metadata.py`](../scripts/refresh_registry_metadata.py) | Registry generator (server-card, glama, MCPB manifest) |
 
 ---
 
@@ -418,9 +383,10 @@ python3 -c "from mcp_brs.server import mcp; print(mcp.name)"
 # List all registered tools
 python3 -c "
 from mcp_brs.server import mcp
-tools = mcp._tool_manager._tools
-for name in tools:
-    print(f'  {name}')
+import asyncio
+tools = asyncio.run(mcp.list_tools())
+for t in tools:
+    print(f'  {t.name}')
 "
 
 # Show CLI help
@@ -428,9 +394,6 @@ python3 mcp_brs/server.py --help
 
 # Run (stdio — for MCP clients)
 python3 mcp_brs/server.py
-
-# Run (SSE — for remote agents, test with curl)
-python3 mcp_brs/server.py --transport sse --port 8080
 ```
 
 ---
@@ -455,14 +418,13 @@ def call(m, p):
     h = dict(H); h["Mcp-Session-Id"] = sid
     return httpx.post(BASE, headers=h, json={"jsonrpc": "2.0", "id": 1, "method": m, "params": p}, timeout=20)
 call("notifications/initialized", {})
-print(call("tools/call", {"name": "get_convergence", "arguments": {}}).text[:200])        # EXPECT real JSON
-print(call("tools/call", {"name": "get_directional_bias", "arguments": {}}).text[:200])   # EXPECT 402 x402
+print(call("tools/call", {"name": "brs_market_state", "arguments": {}}).text[:200])       # EXPECT real JSON
+print(call("tools/call", {"name": "brs_decision_context", "arguments": {}}).text[:200])  # EXPECT 402 x402
 ```
 
-Expected: `get_convergence` / `get_regime_current` → real data (keyless
-free tier); `get_directional_bias` / `get_signal_history` → the 402 x402
-message (the gate works through the MCP). Anything else = upstream
-misconfigured.
+Expected: `brs_market_state` → real data (keyless free tier);
+`brs_decision_context` → the 402 x402 message (the gate works through the MCP).
+Anything else = upstream misconfigured.
 
 ---
 
@@ -480,19 +442,16 @@ headers = {
 }
 ```
 
-- No key → free tier (unchanged; Pro tools return the 402 x402 message).
+- No key → free tier (only the 4 Free tools are visible; Pro tools return the
+  402 x402 message).
 - Valid key → the caller's own tier (Pro data), attributed to their key.
 - Invalid key → upstream 401 `Invalid or missing API key`.
-
-> **Aug 17 — DEPLOYED (K3-approved).** Clients can now send their own key to
-> unlock Pro per-request. Review brief:
-> [`plans/Q58-OptionC_k3_review.md`](../plans/Q58-OptionC_k3_review.md).
 
 ---
 
 ## Related Docs
 
 - [BRS Signals API Docs](https://brs-signals.com/docs)
-- [Three Eyes Architecture](../plans/three_eyes_architecture.md)
-- [LangChain Integration](../integrations/langchain_tool.py)
+- [Canonical metadata](../mcp_brs/metadata.py)
+- [Registry generator](../scripts/refresh_registry_metadata.py)
 - [MCP Protocol Specification](https://modelcontextprotocol.io)

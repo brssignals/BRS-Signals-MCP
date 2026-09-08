@@ -5,11 +5,25 @@
 Live Bitcoin market regime for AI agents: three independent sensors read
 pre-price data — fee curves, funding velocity, whale flows, absence — every
 30s and reject almost everything. When they converge, you get a directional
-call with the evidence attached. The data doesn't exist in history; it exists
-right now and can't be reconstructed. **Provable silence:** the public
-rejection funnel shows exactly how many reads died at each gate, so your
-agent can audit the silence, not just the signals. MCP + REST + x402. Free
-tier, no card.
+call with the evidence attached. The data can't be reconstructed from history.
+**Provable silence:** the public rejection funnel shows exactly how many reads
+died at each gate, so your agent can audit the silence, not just the signals.
+MCP + REST + x402. Free tier, no card.
+
+## Don't trust us — query us
+
+The full public track record is an endpoint, not a PDF. Point your agent at
+it and let it reach its own conclusion:
+
+```
+"BRS Signals claims it rejects almost every read. Pull its public track
+record (brs_audit_track_record) and today's rejection funnel
+(brs_rejection_funnel), and tell me: does the data support the claim,
+and what happened after each call at +4h and +24h?"
+```
+
+Both of those tools are keyless — no API key, no payment, no signup. That is
+the point: the honesty surface is open by design.
 
 ## Use it in 30 seconds — remote, no install
 
@@ -28,14 +42,6 @@ Or add `.cursor/mcp.json`:
   }
 }
 ```
-
-**OpenClaw** — run in your terminal:
-
-```bash
-openclaw mcp add brs-signals --transport streamable-http --url https://brs-signals.com/mcp
-```
-
-(or OpenClaw Web UI → `/settings/mcp` → add an HTTP/SSE endpoint at that URL)
 
 **Claude Desktop** (MCP is free) — Settings → Developer → Edit Config:
 
@@ -76,24 +82,6 @@ brs-mcp                                # starts the MCP server (stdio)
 **Cursor (stdio)** — Settings → Features → MCP → Add New MCP Server:
 Type `command` · Command `python3 -m mcp_brs` · Env `BRS_API_KEY`.
 
-**OpenClaw (stdio)**:
-
-```bash
-openclaw mcp add brs-signals --command python3 --arg -m --arg mcp_brs
-```
-
-## Don't trust us — query us
-
-The full public track record is an endpoint, not a PDF. Point your agent at
-it and let it reach its own conclusion:
-
-```
-"BRS Signals claims it rejects almost every read. Pull its public track
-record (get_signal_history) and today's rejection funnel
-(get_rejection_funnel), and tell me: does the data support the claim,
-and what happened after each call at +4h and +24h?"
-```
-
 ## What You Get
 
 Three independent sensors running every 30 seconds, fused into one convergence score:
@@ -108,60 +96,42 @@ When all three agree → conviction. When they disagree → silence.
 
 ## MCP Tools
 
-**16 tools.** What each tier can call:
+**7 tools.** Discovery is authorization-scoped: keyless callers see only the
+4 Free tools; a caller presenting a key sees all 7 (the upstream API still
+enforces Pro on call).
 
-| Tool | Keyless | Free key | Pro |
-|------|:---:|:---:|:---:|
-| `get_convergence` | ✅ | ✅ | ✅ |
-| `get_regime_current` | ✅ | ✅ | ✅ |
-| `get_system_health` | ✅ | ✅ | ✅ |
-| `get_system_counters` | ✅ | ✅ | ✅ |
-| `get_rejection_funnel` | ✅ | ✅ | ✅ |
-| `get_fee_histogram` | — | ✅ | ✅ |
-| `get_funding_divergence` | — | ✅ | ✅ |
-| `get_dashboard` | — | ✅ | ✅ |
-| `get_directional_bias` | — | — | ✅ |
-| `get_signal_history` | — | — | ✅ |
-| `get_stablecoin_flows` | — | — | ✅ |
-| `get_gamma_exposure` | — | — | ✅ |
+### Free — no key required
 
-**No BRS API** — `query_db` (read-only SQLite on the server) and the three
-`get_mempool_*` / `get_block_tip` tools (live mempool.space) need no key.
+| Tool | What it returns |
+|------|-----------------|
+| `brs_market_state` | Regime structure + three-eye convergence + system health (call first) |
+| `brs_audit_track_record` | Public proof — every call and what BTC did next (+4h/+24h) |
+| `brs_rejection_funnel` | Per-gate cycle counts: why no signal came out |
+| `brs_system_status` | Component health + sample size behind every reading |
 
-**Regime & direction**
-- `get_convergence` — All three engine verdicts + convergence score
-- `get_regime_current` — Market regime + active events
-- `get_directional_bias` — bullish/bearish/WAIT with confidence (Pro)
-- `get_signal_history` — Recent decisions (Pro)
+### Pro — key or x402 required
 
-**Underlying streams**
-- `get_fee_histogram` — Mempool fee curve shape analysis (free key)
-- `get_funding_divergence` — Cross-exchange funding squeeze (free key)
-- `get_stablecoin_flows` — Whale stablecoin transfers (Pro)
-- `get_gamma_exposure` — Dealer gamma + flip level (Pro)
-- `get_dashboard` — Bundled regime + signal + funding (free key)
+| Tool | What it returns |
+|------|-----------------|
+| `brs_decision_context` | Directional posture (bullish / bearish / WAIT) with evidence |
+| `brs_history` | Recent calls with resolved outcomes |
+| `brs_raw_stream` | One raw stream: `fees`, `funding`, `stablecoin`, or `gamma` |
 
-**System & audit**
-- `get_system_health` — Component-by-component health check
-- `get_system_counters` — Signals sent, data points, days collecting
-- `get_rejection_funnel` — Per-gate cycle counts: why no signal
-- `query_db` — Read-only SQL against the BRS database
-
-**Bitcoin network · live** (mempool.space)
-- `get_mempool_fees` — Recommended fee rates (sat/vB)
-- `get_mempool_stats` — Pending tx count, vsize, total fees
-- `get_block_tip` — Current block height
+> **WAIT means no edge.** The system tells you which game the market is
+> playing and how much the sensors agree — it is context, not an instruction
+> to trade.
 
 ## Pricing
 
-- **Free tier** — Regime classification + convergence score (5 req/min). No card.
-- **Pro tier ($50/mo)** — Full directional bias + raw streams + unlimited requests
-- **Per-call ($0.01/query)** — Pro bias, pay-as-you-go via x402 (USDC on
-  Solana or Base): hit `/api/v2/bias/per-call`, pay the 402, retry with
-  `?tx_signature=` + your free key. Capped at $50 per rolling 30 days, then
-  converts to Pro — never more than $50 in any 30 days. Solana + Base.
-- **x402** — Agents with wallets pay per access in USDC; no signup, no human
-- **Founding rate** — Use code `FOUNDING50` at checkout: $30/mo for 3 months (first 50 subscribers only)
+- **Free tier** — Regime classification + convergence score + the public
+  proof (5 req/min). No card.
+- **Pro tier ($50/mo)** — Directional posture + raw streams + full history,
+  60 req/min.
+- **Per-call ($0.01/query)** — the Pro posture one query at a time via x402
+  (USDC on Solana or Base): hit `/api/v2/bias/per-call`, pay the 402, retry
+  with `?tx_signature=` + your free key. Capped at $50 per rolling 30 days,
+  then converts to Pro — never more than $50 in any 30 days.
+- **x402** — Agents with wallets pay per access in USDC; no signup, no human.
 
 Get your API key at [brs-signals.com](https://brs-signals.com).
 

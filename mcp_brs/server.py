@@ -3,38 +3,52 @@
 ========================
 Exposes the BRS Signals API as MCP tools for AI agents.
 
-Endpoints wrapped:
-  /api/v2/confidence          → get_convergence        (Three Eyes: all 3 engines + convergence score)
-  /api/v2/bias                → get_directional_bias   (bullish/bearish/WAIT with confidence)
-  /api/v2/bias/history        → get_signal_history     (Recent decoder decisions)
-  /api/v2/structure           → get_regime_current     (Market regime + active events)
-  /api/v2/streams/fees        → get_fee_histogram      (Mempool fee curve shape)
-  /api/v2/streams/funding     → get_funding_divergence (Cross-exchange funding squeeze)
-  /api/v2/streams/stablecoin  → get_stablecoin_flows   (Whale stablecoin transfers)
-  /api/v2/streams/gamma       → get_gamma_exposure     (Dealer gamma + flip level)
-  /api/v2/dashboard           → get_dashboard          (Bundled regime + signal + funding)
-  /api/v2/system/counters     → get_system_counters    (Live data counters)
-  /api/v2/health/funnel       → get_rejection_funnel   (Per-gate cycle counts: why no signal)
-  /api/v1/system/health       → get_system_health      (Quick health check)
-  (no API)                    → query_db               (Read-only SQL against the BRS SQLite DB)
-  (mempool.space)             → get_mempool_fees       (Recommended fee rates, sat/vB)
-  (mempool.space)             → get_mempool_stats      (Pending tx count, vsize, total fees)
-  (mempool.space)             → get_block_tip          (Current block height)
+Canonical tool surface (7 tools):
+  brs_market_state        (Free)  → /api/v2/structure + /api/v2/confidence + /api/v1/system/health
+  brs_decision_context    (Pro)   → /api/v2/bias/per-call (x402 metered)
+  brs_history             (Pro)   → /api/v2/bias/history
+  brs_audit_track_record  (Free)  → /api/v2/signals/track-record (public proof — keyless)
+  brs_rejection_funnel    (Free)  → /api/v2/health/funnel
+  brs_system_status       (Free)  → /api/v1/system/health (incl. SLO) + /api/v2/system/counters
+  brs_raw_stream          (Pro)   → /api/v2/streams/{fees,funding,stablecoin,gamma}
 
-Auth: Set BRS_API_KEY env var for paid tiers (Pro/Max).
-      Free tier works without a key (rate-limited).
+Auth model (BRS-013, audit §5.5):
+  - Per-client API key pass-through (Q58 Option C) is the metered identity
+    layer: the caller's own key is forwarded verbatim upstream.
+  - x402 challenges (carried as PAYMENT_REQUIRED by BRS-012) handle one-off
+    paid calls — no signup required for metered agent context.
+  - OAuth/scopes are reserved for persistent users long-term; a static shared
+    server key is NOT a paid-user identity and is rejected for public launch.
+
+Authorization-scoped discovery: keyless callers see only the 4 Free tools;
+a caller presenting a key sees the full 7-tool surface, and the upstream BRS
+API still enforces Pro (401/402) on call — no Pro tool is callable keyless.
+
+Telemetry (BRS-018): every tool call emits one append-only, non-PII event
+(tool, tier, outcome, error_code, duration_ms, client fingerprint) to
+data/telemetry/mcp_events.jsonl. Keys and tx signatures are never recorded.
+Opt out with BRS_MCP_TELEMETRY=0.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
+import hashlib
 import json
 import os
-from typing import Optional
+import time
+import uuid
+from urllib.parse import urlencode
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator, Literal, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import Tool as MCPTool, ToolAnnotations
+from pydantic import BaseModel, Field
 
 # ── Configuration ──────────────────────────────────────────────────
 
@@ -59,8 +73,145 @@ _ALLOWED_HOSTS = [
     "brs-signals.com", "www.brs-signals.com",
 ]
 
-mcp = FastMCP(
+# ── Pooled HTTP client (BRS-011) ───────────────────────────────────
+
+_HTTP_TIMEOUT = 15.0
+_MAX_RETRIES = 3
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+_client: httpx.AsyncClient | None = None
+_client_lock = asyncio.Lock()
+
+
+def _backoff(attempt: int) -> float:
+    """Exponential backoff: 0.25s, 0.5s, 1s, ..."""
+    return 0.25 * (2 ** attempt)
+
+
+async def _get_client() -> httpx.AsyncClient:
+    """Return the process-wide pooled AsyncClient, creating it lazily.
+
+    One shared client gives connection reuse across all 7 tools instead of a
+    fresh client (and socket) per call. The lifespan closes it on shutdown;
+    the lazy path covers direct/test invocation without a lifespan.
+    """
+    global _client
+    if _client is not None:
+        return _client
+    async with _client_lock:
+        if _client is None:
+            _client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
+    return _client
+
+
+@asynccontextmanager
+async def _lifespan(app: FastMCP) -> AsyncIterator[None]:
+    """Create the pooled client on startup, close it on shutdown."""
+    client = await _get_client()
+    try:
+        yield
+    finally:
+        await client.aclose()
+        global _client
+        _client = None
+
+
+# ── Authorization-scoped tool discovery (BRS-013) ──────────────────
+# Auth model decision (audit §5.5): per-client API key pass-through is the
+# metered identity layer; x402 (carried by BRS-012) covers one-off paid calls;
+# OAuth/scopes are reserved for persistent users long-term. A static shared
+# server key is NOT a paid-user identity (Q58: rejected for public launch).
+#
+# Discovery reflects the caller's tier: keyless callers see only Free tools;
+# a caller presenting a key sees the full surface, and the upstream BRS API
+# still enforces Pro (401/402) on call — no Pro tool is callable keyless.
+_FREE_TIER_META: dict[str, str] = {"tier": "free"}
+_PRO_TIER_META: dict[str, str] = {"tier": "pro"}
+
+
+def _has_key() -> bool:
+    """True when the caller presents a key (Q58 per-client pass-through) or the
+    server env key is set (self-host stdio). Mirrors _headers() precedence."""
+    return bool(_client_key.get() or API_KEY)
+
+
+class _TieredFastMCP(FastMCP):
+    """FastMCP with authorization-scoped discovery (BRS-013) + telemetry (BRS-018)."""
+
+    async def list_tools(self) -> list[MCPTool]:
+        tools = await super().list_tools()
+        if _has_key():
+            return tools
+        return [t for t in tools if (t.meta or {}).get("tier") != "pro"]
+
+    @staticmethod
+    def _outcome_of(result: Any) -> tuple[str, Optional[str]]:
+        """Derive (outcome, error_code) from a tool result envelope.
+
+        Handles both structured (tuple of content + dict) and unstructured
+        (ContentBlock list) FastMCP results. Never raises.
+        """
+        payload: dict[str, Any] = {}
+        if isinstance(result, tuple):
+            for part in result:
+                if isinstance(part, dict):
+                    payload = part
+                    break
+        elif isinstance(result, dict):
+            payload = result
+        status = str(payload.get("status", "ok"))
+        err = payload.get("error")
+        code: Optional[str] = None
+        if isinstance(err, dict):
+            code = err.get("code")
+        if status in ("ok", "degraded", "stale"):
+            outcome = status
+        elif status in ("unavailable", "error"):
+            outcome = "error"
+        else:
+            outcome = status
+        return outcome, code
+
+    def _client_id(self) -> Optional[str]:
+        try:
+            return self.get_context().client_id
+        except Exception:
+            return None
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Call a tool, then record one non-PII telemetry event (BRS-018).
+
+        The event captures tool name, tier, outcome, error code and latency —
+        the audit §11.1 north-star inputs — and nothing identifying: the
+        caller is a truncated fingerprint, never a key or tx. Recording is
+        best-effort and can never affect the tool result.
+        """
+        from mcp_brs import telemetry
+
+        tier = "pro" if _has_key() else "free"
+        started = time.monotonic()
+        try:
+            result = await super().call_tool(name, arguments)
+        except Exception:
+            telemetry.record(
+                name, tier=tier, outcome="exception",
+                error_code="INTERNAL_ERROR",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                client_id=self._client_id(), client_key=_client_key.get(),
+            )
+            raise
+        outcome, code = self._outcome_of(result)
+        telemetry.record(
+            name, tier=tier, outcome=outcome, error_code=code,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            client_id=self._client_id(), client_key=_client_key.get(),
+        )
+        return result
+
+
+mcp = _TieredFastMCP(
     "brs-signals",
+    lifespan=_lifespan,
     instructions="₿RS Signals — pre-price, three-eye Bitcoin signals. "
     "Three independent sensors read pre-price flows (mempool fee-curve shape, "
     "funding velocity, whale flows) every 30s and reject almost everything. "
@@ -85,14 +236,37 @@ def _headers() -> dict:
     return h
 
 
-async def _get(endpoint: str, timeout: float = 15.0) -> dict:
-    """Call the BRS Signals API. Returns dict (data or error info)."""
+async def _get(endpoint: str, timeout: float = _HTTP_TIMEOUT) -> dict:
+    """Call the BRS Signals API via the pooled client. Returns dict (data or
+    error info). Retries transient failures (429/5xx, timeouts, connect errors)
+    with exponential backoff; 401/402 are terminal and returned immediately."""
     url = f"{BASE_URL}{endpoint}"
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url, headers=_headers())
+    client = await _get_client()
+    last: dict[str, Any] | None = None
+
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            r = await client.get(url, headers=_headers(), timeout=timeout)
+        except httpx.TimeoutException:
+            last = {
+                "code": "UPSTREAM_TIMEOUT",
+                "error": "BRS API timed out",
+                "retry_after_seconds": 5,
+                "how_to_fix": "Try again in a few seconds",
+            }
+        except httpx.ConnectError:
+            last = {
+                "code": "UPSTREAM_UNAVAILABLE",
+                "error": f"Cannot connect to {BASE_URL}",
+                "retry_after_seconds": 5,
+                "how_to_fix": "Check network or BRS_API_URL",
+            }
+        except Exception as e:
+            return {"code": "INTERNAL_ERROR", "error": str(e)}
+        else:
             if r.status_code == 401:
                 return {
+                    "code": "AUTH_REQUIRED",
                     "error": "Invalid or missing API key",
                     "how_to_fix": (
                         "Set BRS_API_KEY environment variable, "
@@ -100,260 +274,447 @@ async def _get(endpoint: str, timeout: float = 15.0) -> dict:
                     ),
                 }
             if r.status_code == 402:
+                # Carry the full upstream x402 challenge (v2 accepts[]/resource
+                # or legacy payment{}), not a flattened "Pro required", so P2
+                # (BRS-017) can construct the actual on-chain payment.
+                try:
+                    challenge = r.json()
+                except Exception:
+                    challenge = None
                 return {
+                    "code": "PAYMENT_REQUIRED",
                     "error": "Payment required (x402)",
-                    "pro_required": True,
-                    "amount": "$50/month (Pro tier)",
-                    "how_to_pay": (
-                        "Send USDC on Solana or Base (via x402) or sign up at "
-                        "https://brs-signals.com"
+                    "how_to_fix": (
+                        "Pay the x402 challenge or upgrade at "
+                        "https://brs-signals.com/signup"
                     ),
-                    "upgrade_url": "https://brs-signals.com/signup",
+                    "payment": challenge,
                     "free_tier": "Get a free API key for regime data (5 req/min)",
                 }
             if r.status_code == 429:
-                return {
+                last = {
+                    "code": "RATE_LIMITED",
                     "error": "Rate limit exceeded",
                     "how_to_fix": "Wait 60 seconds or upgrade to Pro/Max tier",
+                    "retry_after_seconds": 60,
                 }
-            r.raise_for_status()
-            return r.json()
-    except httpx.TimeoutException:
-        return {"error": "BRS API timed out", "retry": "Try again in a few seconds"}
-    except httpx.ConnectError:
-        return {"error": f"Cannot connect to {BASE_URL}", "retry": "Check network or BRS_API_URL"}
-    except Exception as e:
-        return {"error": str(e)}
+            elif r.status_code in _RETRYABLE_STATUSES:
+                last = {
+                    "code": "UPSTREAM_ERROR",
+                    "error": f"BRS API returned HTTP {r.status_code}",
+                    "retry_after_seconds": 5,
+                    "how_to_fix": "Try again in a few seconds",
+                }
+            else:
+                r.raise_for_status()
+                return r.json()
+
+        # Transient failure — retry with backoff if attempts remain.
+        if attempt < _MAX_RETRIES:
+            await asyncio.sleep(_backoff(attempt))
+            continue
+        return last or {"code": "INTERNAL_ERROR", "error": "Unknown error"}
+
+    return last or {"code": "INTERNAL_ERROR", "error": "Unknown error"}
 
 
-def _fmt(data: dict) -> str:
-    """Pretty-print dict as JSON string for MCP text response."""
-    return json.dumps(data, indent=2, default=str)
+# ── Result envelope (audit §4.2) ───────────────────────────────────
+
+# All market-reading tools are read-only, non-destructive, idempotent for the
+# same observation instant, and open-world (they access external/current data).
+_READ_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
+
+SCHEMA_VERSION = "1.0"
+METHODOLOGY_VERSION = "2026.09"
+DISCLAIMER = "Market-structure context; not an execution instruction."
+
+
+class ErrorInfo(BaseModel):
+    """Structured error carried inside the envelope (audit §4.3 / BRS-012).
+
+    Every failure maps to one stable ``code`` plus a ``retryable`` flag, an
+    optional ``retry_after_seconds``, a human ``how_to_fix``, and — for
+    ``PAYMENT_REQUIRED`` — a typed ``payment`` challenge that P2 (BRS-017)
+    can act on directly.
+    """
+
+    code: str
+    message: str
+    retryable: bool = False
+    retry_after_seconds: Optional[int] = None
+    how_to_fix: Optional[str] = None
+    payment: Optional["PaymentChallenge"] = None
+
+
+class PaymentChallenge(BaseModel):
+    """x402 payment challenge on a PAYMENT_REQUIRED error (audit §17.2).
+
+    Carries exactly what P2 needs to construct the on-chain payment: amount,
+    currency, accepted networks, recipient, and the submit URL where the
+    signed tx is returned. ``raw`` preserves the full upstream 402 body so
+    nothing the server advertised is dropped.
+
+    Spend-safety fields (audit §6.2) ride alongside so a payment-aware bridge
+    can enforce caps before signing: ``asset`` (what to pay with), ``scheme``
+    (how the exact amount is matched), ``max_timeout_seconds`` (expiry),
+    ``request_digest`` (a stable digest binding the payment to this exact
+    request), and ``max_retries`` (the policy ceiling on re-calls — the
+    per-call ledger already makes retries idempotent via ``already_processed``).
+    """
+
+    protocol: str = "x402"
+    amount: Optional[str] = None
+    currency: str = "USDC"
+    networks: list[str] = Field(default_factory=list)
+    recipient: Optional[str] = None
+    resource: Optional[str] = None
+    submit_url: Optional[str] = None
+    scheme: Optional[str] = None
+    asset: Optional[str] = None
+    max_timeout_seconds: Optional[int] = None
+    max_retries: int = 3
+    request_digest: Optional[str] = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class QualityInfo(BaseModel):
+    """Best-effort evidence/quality summary for a reading."""
+
+    sources_expected: int = 0
+    sources_healthy: int = 0
+    sample_size: Optional[int] = None
+
+
+class ResultEnvelope(BaseModel):
+    """Standard result envelope (audit §4.2) — success and error paths.
+
+    Every tool returns this shape so an agent never has to guess whether
+    "old data" means "quiet market" or "broken collector".
+    """
+
+    schema_version: str = SCHEMA_VERSION
+    methodology_version: str = METHODOLOGY_VERSION
+    as_of: str
+    freshness_seconds: int = 0
+    valid_for_seconds: int = 90
+    status: Literal["ok", "degraded", "stale", "unavailable", "error"]
+    tier: str = "free"
+    data: Optional[dict[str, Any]] = None
+    evidence: list[Any] = Field(default_factory=list)
+    quality: Optional[QualityInfo] = None
+    request_id: str
+    disclaimer: str = DISCLAIMER
+    error: Optional[ErrorInfo] = None
+
+
+def _iso_now() -> str:
+    """Current UTC time as ISO-8601 with a Z suffix (second precision)."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _new_request_id() -> str:
+    """Short, unique, non-sensitive correlation id for one envelope."""
+    return f"brs_{uuid.uuid4().hex[:12]}"
+
+
+# ── Error model (audit §4.3 / BRS-012) ──────────────────────────────
+# Stable, documented error codes. Every failure maps to exactly one code,
+# a `retryable` flag, and (for PAYMENT_REQUIRED) a typed payment challenge:
+#   AUTH_REQUIRED        → bad/missing key            (terminal)
+#   PAYMENT_REQUIRED     → x402 challenge carried     (terminal; has .payment)
+#   RATE_LIMITED         → 429                         (retryable)
+#   UPSTREAM_TIMEOUT     → upstream slow               (retryable)
+#   UPSTREAM_UNAVAILABLE → cannot connect              (retryable)
+#   UPSTREAM_ERROR       → upstream 5xx                (retryable)
+#   STALE_DATA           → data too old                (retryable)
+#   SOURCE_DEGRADED      → sensor partial              (retryable)
+#   INVALID_ARGUMENT     → caller input bad            (terminal)
+#   INTERNAL_ERROR       → unexpected local error      (terminal)
+_RETRYABLE_ERRORS = {
+    "AUTH_REQUIRED": False,
+    "PAYMENT_REQUIRED": False,
+    "RATE_LIMITED": True,
+    "UPSTREAM_TIMEOUT": True,
+    "UPSTREAM_UNAVAILABLE": True,
+    "UPSTREAM_ERROR": True,
+    "STALE_DATA": True,
+    "SOURCE_DEGRADED": True,
+    "INVALID_ARGUMENT": False,
+    "INTERNAL_ERROR": False,
+}
+
+
+def _short_chain(network: str) -> str:
+    """CAIP-2 → short chain name for the challenge's networks list."""
+    if network.startswith("eip155:"):
+        return "base"
+    if network.startswith("solana:"):
+        return "solana"
+    return network
+
+
+def _challenge_digest(body: Any) -> str:
+    """Deterministic digest binding a payment to this exact challenge.
+
+    A payment-aware client can hash the challenge it received and present the
+    digest when retrying, so a signed tx cannot be replayed against a
+    different amount/recipient (audit §6.2 "request digest").
+    """
+    try:
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                               default=str)
+    except Exception:
+        canonical = str(body)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def _per_call_endpoint(tx_signature: str = "", chain: str = "solana",
+                       ref: str = "") -> str:
+    """Build the metered per-call URL.
+
+    First call (no ``tx_signature``) -> the bare endpoint, which returns the
+    402 challenge. Retry (with a settlement signature) -> the settle/verify
+    leg carrying ``chain`` and ``ref``. Query values are URL-encoded.
+    """
+    q: dict[str, str] = {}
+    if tx_signature:
+        q["tx_signature"] = tx_signature
+        q["chain"] = chain
+        if ref:
+            q["ref"] = ref
+    endpoint = "/api/v2/bias/per-call"
+    if q:
+        endpoint += "?" + urlencode(q)
+    return endpoint
+
+
+def _extract_payment_challenge(body: Any) -> dict[str, Any]:
+    """Normalize a 402 body into ``PaymentChallenge`` kwargs.
+
+    Tolerates both legacy ``{payment: {...}}`` and v2
+    ``{accepts: [...], resource: {...}}`` shapes. Returns an empty-skeleton
+    dict when nothing recognizable is present.
+    """
+    raw = body if isinstance(body, dict) else {}
+    payment = raw.get("payment") if isinstance(raw.get("payment"), dict) else {}
+    accepts = raw.get("accepts") or []
+
+    networks: list[str] = []
+    recipient = payment.get("recipient")
+    amount = payment.get("amount")
+    scheme = None
+    asset = None
+    max_timeout_seconds = None
+    if isinstance(accepts, list):
+        for acc in accepts:
+            if isinstance(acc, dict):
+                net = acc.get("network")
+                if net:
+                    networks.append(_short_chain(str(net)))
+                recipient = recipient or acc.get("payTo")
+                amount = amount if amount is not None else acc.get("amount")
+                scheme = scheme or acc.get("scheme")
+                asset = asset or acc.get("asset")
+                if max_timeout_seconds is None and isinstance(acc.get("maxTimeoutSeconds"), int):
+                    max_timeout_seconds = acc["maxTimeoutSeconds"]
+
+    resource = raw.get("resource")
+    resource_url = resource.get("url") if isinstance(resource, dict) else None
+
+    return {
+        "protocol": "x402",
+        "amount": str(amount) if amount is not None else None,
+        "currency": str(payment.get("currency") or "USDC"),
+        "networks": networks or ["solana"],
+        "recipient": recipient,
+        "resource": resource_url,
+        "submit_url": payment.get("submit_url"),
+        "scheme": scheme,
+        "asset": asset,
+        "max_timeout_seconds": max_timeout_seconds,
+        "request_digest": _challenge_digest(raw),
+        "raw": raw,
+    }
+
+
+def _error_envelope(code: str, message: str, tier: str = "free",
+                    retry_after_seconds: Optional[int] = None,
+                    how_to_fix: Optional[str] = None,
+                    payment: Optional[dict[str, Any]] = None) -> ResultEnvelope:
+    """Build a failed envelope directly (for local validation errors)."""
+    return ResultEnvelope(
+        as_of=_iso_now(),
+        status="error",
+        tier=tier,
+        request_id=_new_request_id(),
+        error=ErrorInfo(
+            code=code,
+            message=message,
+            retryable=_RETRYABLE_ERRORS.get(code, False),
+            retry_after_seconds=retry_after_seconds,
+            how_to_fix=how_to_fix,
+            payment=PaymentChallenge(**_extract_payment_challenge(payment)) if payment else None,
+        ),
+    )
+
+
+def _envelope(payload: dict[str, Any], tier: str = "free") -> ResultEnvelope:
+    """Wrap an upstream read in the standard envelope.
+
+    Detects upstream/local error dicts (presence of an "error" key) and marks
+    the envelope `status="error"` with a typed `error` payload, so success and
+    failure both honor one shape.
+    """
+    if isinstance(payload, dict) and payload.get("error"):
+        return _error_envelope(
+            code=payload.get("code", "INTERNAL_ERROR"),
+            message=str(payload["error"]),
+            tier=tier,
+            retry_after_seconds=payload.get("retry_after_seconds"),
+            how_to_fix=payload.get("how_to_fix"),
+            payment=payload.get("payment"),
+        )
+    return ResultEnvelope(
+        as_of=_iso_now(),
+        status="ok",
+        tier=tier,
+        data=payload,
+        request_id=_new_request_id(),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Tools — Three Eyes Architecture (Primary)
+# Tools — canonical 7-tool surface (audit §4.1)
 # ═══════════════════════════════════════════════════════════════════
 
-@mcp.tool()
-async def get_convergence() -> str:
-    """How much do the three independent sensors agree right now?
+@mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_FREE_TIER_META)
+async def brs_market_state() -> ResultEnvelope:
+    """Canonical current market posture. Call this FIRST.
 
-    Call this BEFORE trusting any directional read. Agreement is scored
-    pairwise: 1.00 same meta-regime, 0.85 same direction, 0.60 one sensor
-    silent, 0.25 open conflict, 0.00 unreadable. High agreement means
-    conditions are worth acting on; low agreement means the sensors are
-    looking at different markets and the honest answer is wait.
+    Bundles the three public, keyless reads into one call:
+      - regime structure (which game the market is playing)
+      - three-eye convergence (how much the sensors agree)
+      - system health (whether the instrument is operational)
 
-    Returns all three verdicts (X-Ray on-chain, Pulse off-chain, Shadow
-    absence), the convergence score, the dominant meta-regime
-    (TRENDING_UP, TRENDING_DOWN, RANGE_ACCUMULATION, RANGE_DISTRIBUTION),
-    shift_brewing (entropy rising = regime change may be imminent), gamma
-    exposure, and the system entropy gradient.
+    Returns market_structure, convergence, and system_health together with
+    their as_of timestamps. If any read is stale or a sensor is down, that
+    changes what every other answer means — check health before trusting a
+    directional read. Free tier, no API key required.
     """
-    return _fmt(await _get("/api/v2/confidence"))
+    structure, convergence, health = await asyncio.gather(
+        _get("/api/v2/structure"),
+        _get("/api/v2/confidence"),
+        _get("/api/v1/system/health"),
+    )
+    for part in (structure, convergence, health):
+        if isinstance(part, dict) and part.get("error"):
+            return _envelope(part)
+    return _envelope({
+        "market_structure": structure,
+        "convergence": convergence,
+        "system_health": health,
+    })
 
 
-@mcp.tool()
-async def get_directional_bias() -> str:
-    """Should you be trading Bitcoin right now, and in which direction?
+@mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_PRO_TIER_META)
+async def brs_decision_context(
+    tx_signature: str = "",
+    chain: str = "solana",
+    ref: str = "",
+) -> ResultEnvelope:
+    """Directional market context with evidence and caveats (Pro tier).
 
-    Returns side (bullish / bearish / WAIT) with confidence, the regime
-    and zone the call was made in, the reason, btc_price and timestamp.
-    WAIT is the most common answer and means no edge exists — respect it;
-    do not force a trade. Confidence is normalised against how much
-    evidence was reachable: sent signals typically land 0.30–0.50, so
-    compare against the distribution, not 1.0. Signals suppressed by the
-    noise filter are shown (suppressed=true), never hidden.
+    Returns the current posture (bullish / bearish / WAIT) with the regime
+    and zone it was read in, the reason, confidence, btc_price and timestamp.
+    WAIT is the most common answer and means no edge is visible — it is
+    context, not an instruction. Confidence is normalised against how much
+    evidence was reachable: sent signals typically land 0.30–0.50, so compare
+    against that distribution, not 1.0. Suppressed reads are shown
+    (suppressed=true), never hidden.
 
-    Requires a Pro API key or x402 payment. Free alternative:
-    get_convergence.
+    Payment (BRS-017): this is the metered Pro posture and is payable per-call
+    via x402. Call it with no tx_signature first — if the result is
+    status='error' with error.code='PAYMENT_REQUIRED', inspect error.payment:
+    that carries the exact amount, currency, asset, networks, recipient, expiry
+    and request_digest needed to build the settlement. Pay on an advertised
+    rail, then re-call with the tx_signature (and matching chain/ref) to get
+    the metered result. Retries are idempotent — the same tx_signature is
+    never charged twice. A Pro key (BRS_API_KEY or a per-client key) skips
+    payment entirely. Spend caps: max 3 re-calls per request; enforce your own
+    max-per-call/max-per-day policy against error.payment before paying.
+
+    Args:
+        tx_signature: The signed x402 settlement tx from a prior payment. Empty
+            on first call (you will receive the challenge instead).
+        chain: Rail you paid on — "solana" or "base". Default "solana".
+        ref: Optional attribution tag carried through to the payment ledger.
     """
-    return _fmt(await _get("/api/v2/bias"))
+    return _envelope(await _get(_per_call_endpoint(tx_signature, chain, ref)),
+                     tier="pro")
 
 
-@mcp.tool()
-async def get_signal_history(limit: int = 20) -> str:
+@mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_PRO_TIER_META)
+async def brs_history(limit: int = Field(default=20, ge=1, le=200)) -> ResultEnvelope:
     """Recent calls and what Bitcoin did next (Pro tier).
 
     Each record carries timestamp, side, confidence, regime, zone, reason,
-    plus outcomes where resolved (+4h/+24h returns, worst drawdown). Use
-    this to verify rather than trust: outcomes are never re-scored after
-    the fact. The keyless public track record lives at the website's
-    track-record page (also reachable via get_rejection_funnel's sibling
-    REST endpoint /api/v2/signals/track-record).
+    plus resolved outcomes where available (+4h/+24h returns, worst
+    drawdown). Outcomes are fixed once written and never re-scored. Use this
+    to verify rather than trust.
 
     Args:
-        limit: Number of recent signals to return (1–200, default 20)
+        limit: Number of recent calls to return (1–200, default 20).
     """
-    return _fmt(await _get(f"/api/v2/bias/history?limit={min(limit, 200)}"))
+    return _envelope(
+        await _get(f"/api/v2/bias/history?limit={limit}"),
+        tier="pro",
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Tools — Regime Detection
-# ═══════════════════════════════════════════════════════════════════
+@mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_FREE_TIER_META)
+async def brs_audit_track_record(
+    limit: int = Field(default=100, ge=1, le=500),
+) -> ResultEnvelope:
+    """The public proof: every call BRS has made and what Bitcoin did next.
 
-@mcp.tool()
-async def get_regime_current() -> str:
-    """Which game is the market playing right now?
+    Returns the keyless track record — each entry carries timestamp, side
+    (bullish/bearish), price at call time, confidence, regime, zone, and
+    resolved +4h/+24h outcomes where the paper-trading log has them (return
+    %, worst drawdown, best upside). Outcomes are fixed once written and
+    never re-scored, so this is auditable evidence, not marketing.
 
-    Returns the current regime with conviction and how long it has held —
-    accumulation, distribution, trending, reorganizing — as latest_event
-    plus all active_events. Use it to pick the playbook (trend-following
-    vs mean-reversion vs sit out) BEFORE interpreting any individual
-    reading. Free tier, no key needed.
+    This is the "don't trust us — query us" surface: no API key and no
+    payment are required. Use it to verify the system's real silence before
+    trusting any signal.
+
+    Args:
+        limit: Number of recent calls to return (1–500, default 100).
     """
-    return _fmt(await _get("/api/v2/structure"))
+    data = await _get("/api/v2/signals/track-record")
+    if isinstance(data, dict) and data.get("error"):
+        return _envelope(data)
+    signals = data.get("signals", []) if isinstance(data, dict) else []
+    data["signals"] = signals[:limit]
+    return _envelope(data)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Tools — On-Chain Data Sources (the ingredients)
-# ═══════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-async def get_fee_histogram() -> str:
-    """Who is transacting on-chain right now — X-Ray's raw read (free key).
-
-    The mempool fee curve shape: FLAT_WIDE means patient accumulation,
-    STEEP_TALL means urgency or panic, BIMODAL means whale activity.
-
-
-    Returns:
-        - curve_type: FLAT_WIDE (accumulation), STEEP_TALL (retail panic), BIMODAL (whale activity), etc.
-        - actor_profile: Inferred actor behavior from fee distribution
-        - skewness, kurtosis: Statistical shape of fee distribution
-        - gini_coefficient: Inequality of fee spending (low = uniform, high = whales dominating)
-        - entropy: Diversity of fee usage (high = diverse activity, low = single-actor dominance)
-        - tx_count: Number of transactions analyzed
-
-    FLAT_WIDE fee curves indicate accumulation (whales being patient).
-    STEEP_TALL fee curves indicate urgency/panic (retail rushing transactions).
-    """
-    return _fmt(await _get("/api/v2/streams/fees"))
-
-
-@mcp.tool()
-async def get_funding_divergence() -> str:
-    """Is positioning one-sided enough to squeeze? (free key)
-
-    Cross-exchange funding spread, velocity, and squeeze probability.
-    Contrarian by design: the market usually reverses against the crowded
-    side.
-
-
-    Returns:
-        - squeeze_probability: 0–100% chance of a funding squeeze
-        - divergence_direction: Which direction the divergence points (BULLISH/BEARISH/NONE)
-        - max_spread: Maximum spread between exchange funding rates
-        - spread_velocity: How fast the spread is growing (%/min)
-        - Per-exchange rates: Binance, Bybit, OKX, Hyperliquid
-
-    High squeeze probability means traders are piling onto one side —
-    the market usually reverses against them. This is a contrarian signal.
-    """
-    return _fmt(await _get("/api/v2/streams/funding"))
-
-
-@mcp.tool()
-async def get_stablecoin_flows() -> str:
-    """Whale buying or selling intent before it reaches exchanges (Pro).
-
-    Large USDT (Tron) and USDC (Solana) movements: inflow surges precede
-    buying pressure, outflow surges precede distribution.
-
-
-    Returns:
-        - flow_regime: NORMAL, INFLOW_SURGE (buying pressure), OUTFLOW_SURGE (selling pressure)
-        - total_net: Net stablecoin flow (positive = accumulating, negative = distributing)
-        - Recent significant transfers over $1M
-
-    Whale stablecoin flows detect buying/selling intent BEFORE it reaches exchanges.
-    Large USDT inflows to exchange wallets = imminent buying pressure.
-    Large USDT outflows from exchange wallets = whales cashing out.
-    """
-    return _fmt(await _get("/api/v2/streams/stablecoin"))
-
-
-@mcp.tool()
-async def get_gamma_exposure() -> str:
-    """Where does dealer hedging amplify or dampen the move? (Pro stream)
-
-    Net dealer gamma and the flip level that acts as a price magnet.
-
-
-    Returns:
-        - dealer_net_gamma: Net dealer gamma position
-        - gamma_flip_level: Price level where gamma flips (key support/resistance)
-        - put_gamma, call_gamma: Put and call gamma separately
-        - gamma_regime: Current gamma regime interpretation
-
-    Gamma flip levels act as magnetic price levels. Above flip = dealers hedge
-    with the trend (accelerating). Below flip = dealers hedge against the trend
-    (dampening). Large negative gamma = explosive potential.
-    """
-    return _fmt(await _get("/api/v2/streams/gamma"))
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Tools — Dashboard & System
-# ═══════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-async def get_dashboard() -> str:
-    """The full picture in one call (free key). Use the individual tools when
-    you want one answer cheaply; use this when you want everything at once.
-
-    Bundle: regime + signal + funding + suppressed signals.
-
-    Returns:
-        - regime_meta: Full regime classification with confidence and range info
-        - signal: Latest bullish/bearish/WAIT with confidence and reasoning
-        - funding: Cross-exchange funding squeeze data
-        - suppressed: Signals that were filtered by the noise detector
-        - cycle_context: Time cycle analysis (if available)
-        - options_context: Deribit options market context (if available)
-
-    This is the most comprehensive single endpoint — use it when you want
-    the full picture in one call.
-    """
-    return _fmt(await _get("/api/v2/dashboard"))
-
-
-@mcp.tool()
-async def get_system_health() -> str:
-    """Is the instrument operational right now?
-
-    Component-by-component status for all collectors and engines. Call
-    this first if any reading looks stale or absent — a sensor being down
-    changes what every other answer means.
-    """
-    return _fmt(await _get("/api/v1/system/health"))
-
-
-@mcp.tool()
-async def get_system_counters() -> str:
-    """The sample size behind everything: signals sent, data points
-    collected, days collecting. Small samples cannot prove an edge — this
-    tells you exactly how small.
-
-
-    Returns:
-        - signals_fired: Total number of trade signals generated
-        - data_points: Total on-chain data points collected
-        - days_collecting: How many days the system has been running
-    """
-    return _fmt(await _get("/api/v2/system/counters"))
-
-
-@mcp.tool()
-async def get_rejection_funnel(day: str = "", days: int = 0,
-                               since: str = "") -> str:
+@mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_FREE_TIER_META)
+async def brs_rejection_funnel(
+    day: str = "",
+    days: int = Field(default=0, ge=0, le=365),
+    since: str = "",
+) -> ResultEnvelope:
     """Why no signal? The pipeline funnel in one glance (public).
 
     Every cycle that does not become a signal died at a specific gate. This
-    returns the cycle count at each gate in order, so your agent can draw a
-    survival funnel and see where reads are being rejected — the direct
-    answer to "BRS rejects almost everything, prove it."
+    returns the cycle count at each gate in order, so an agent can draw a
+    survival funnel and see where reads are rejected — the direct answer to
+    "BRS rejects almost everything, prove it."
 
     Args:
         day: A specific UTC day (YYYY-MM-DD). Empty = today.
@@ -370,120 +731,95 @@ async def get_rejection_funnel(day: str = "", days: int = 0,
         params = f"?days={days}"
     elif since:
         params = f"?since={since}"
-    return _fmt(await _get(f"/api/v2/health/funnel{params}"))
+    return _envelope(await _get(f"/api/v2/health/funnel{params}"))
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Direct Database Tools (bypass API — faster, no auth)
-# ═══════════════════════════════════════════════════════════════════
+@mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_FREE_TIER_META)
+async def brs_system_status() -> ResultEnvelope:
+    """Instrument health, SLO standing, and the sample size behind every
+    reading (free).
 
-@mcp.tool()
-async def query_db(query: str) -> str:
-    """Run a read-only SQL query against the BRS SQLite database.
-    
-    Tables: decoder_decision_records, engine_verdict_records,
-    regime_event_records, vao_records, funding_records, etc.
-    
-    Use this to check signal history, regime state, or system health
-    without spawning sqlite3 CLI commands.
-    
+    Bundles two keyless reads plus a measured SLO block:
+      - component health: collector/engine status and last-good timestamps
+      - system counters: signals sent, data points collected, days collecting
+      - slo: status, measured latency_ms, boot-epoch uptime, and the
+        registry compliance_pct (generated from canonical metadata, not an
+        ad-hoc claim)
+
+    Call this when any reading looks stale or absent, and to see exactly how
+    small the sample behind a claim is. Small samples cannot prove an edge.
+    """
+    started = time.monotonic()
+    health, counters = await asyncio.gather(
+        _get("/api/v1/system/health"),
+        _get("/api/v2/system/counters"),
+    )
+    latency_ms = round((time.monotonic() - started) * 1000.0, 1)
+    for part in (health, counters):
+        if isinstance(part, dict) and part.get("error"):
+            return _envelope(part)
+
+    # Lazy import (BRS-019): mcp_brs/__init__ imports this module, so metadata
+    # — pure data with no SDK dependency — is resolved only at call time,
+    # mirroring the telemetry lazy-import pattern in _TieredFastMCP.call_tool.
+    from mcp_brs import metadata as _metadata
+
+    uptime = (health or {}).get("slo") or {}
+    slo = {
+        "status": uptime.get("status") or _metadata.REGISTRY_STATUS,
+        "status_detail": uptime.get("status_detail"),
+        "uptime_24h_pct": uptime.get("uptime_24h_pct"),
+        "uptime_note": uptime.get("uptime_note"),
+        "uptime_seconds": uptime.get("uptime_seconds"),
+        "boot_epoch": uptime.get("boot_epoch"),
+        "compliance_pct": _metadata.COMPLIANCE_PCT,
+        "compliance_note": "generated from canonical metadata (BRS-014); "
+                           "CI drift-check fails on any mismatch",
+        "latency_ms": latency_ms,
+        "measured_at": _iso_now(),
+    }
+    return _envelope({"health": health, "counters": counters, "slo": slo})
+
+
+@mcp.tool(structured_output=True, annotations=_READ_ANNOTATIONS, meta=_PRO_TIER_META)
+async def brs_raw_stream(
+    stream: Literal["fees", "funding", "stablecoin", "gamma"] = "fees",
+) -> ResultEnvelope:
+    """Raw pre-price stream for agents doing explicit decomposition (Pro).
+
+    Selects one raw data stream by name:
+      - fees:       mempool fee-curve shape (X-Ray's raw read)
+      - funding:    cross-exchange funding spread and squeeze probability
+      - stablecoin: whale stablecoin transfers (USDT/USDC)
+      - gamma:      dealer gamma exposure and flip level
+
+    These are the ingredients behind the reads, not standalone trade signals.
+    Some streams require a Pro API key. Free alternative: brs_market_state.
+
     Args:
-        query: SQL SELECT statement to execute
-    
-    Returns:
-        JSON array of result rows
+        stream: One of "fees", "funding", "stablecoin", "gamma" (default "fees").
     """
-    import sqlite3, json
-    from pathlib import Path
-    db = Path(__file__).parent.parent / "data" / "vao.db"
-    if not db.exists():
-        return json.dumps({"error": "Database not found"})
-    # Safety: only allow SELECT
-    q = query.strip()
-    if not q.upper().startswith("SELECT"):
-        return json.dumps({"error": "Only SELECT queries allowed"})
-    try:
-        conn = sqlite3.connect(str(db))
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(q).fetchall()
-        conn.close()
-        result = [dict(r) for r in rows[:100]]  # cap at 100 rows
-        return json.dumps(result, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-# ═══════════════════════════════════════════════════════════════════
-# On-Chain Data Tools (Mempool.space — X-Ray sensor verification)
-# ═══════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-async def get_mempool_fees() -> str:
-    """Live Bitcoin mempool fee rates from mempool.space.
-    
-    Returns recommended fees in sat/vB: fastest, half-hour, economy, minimum.
-    Fees above 50 = congestion, above 100 = extreme.
-    Critical for X-Ray sensor verification.
-    """
-    import json, httpx
-    try:
-        with httpx.Client(timeout=8) as client:
-            r = client.get("https://mempool.space/api/v1/fees/recommended")
-            if r.status_code == 200:
-                d = r.json()
-                return json.dumps({
-                    "fastestFee": d.get("fastestFee"),
-                    "halfHourFee": d.get("halfHourFee"),
-                    "economyFee": d.get("economyFee"),
-                    "minimumFee": d.get("minimumFee"),
-                    "unit": "sat/vB",
-                    "note": "Fees above 50 = congestion, above 100 = extreme"
-                }, indent=2)
-            return json.dumps({"error": f"HTTP {r.status_code}"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-async def get_mempool_stats() -> str:
-    """Live mempool stats: pending tx count, total size in vbytes, total fees in BTC.
-    
-    High pending count (>200K) = congestion. Low count (<50K) = quiet.
-    """
-    import json, httpx
-    try:
-        with httpx.Client(timeout=8) as client:
-            r = client.get("https://mempool.space/api/mempool")
-            if r.status_code == 200:
-                d = r.json()
-                return json.dumps({
-                    "pending_tx": d.get("count"),
-                    "total_vsize": d.get("vsize"),
-                    "total_fee_btc": d.get("total_fee"),
-                    "note": f"{d.get('count', 0):,} pending tx"
-                }, indent=2)
-            return json.dumps({"error": f"HTTP {r.status_code}"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-async def get_block_tip() -> str:
-    """Current Bitcoin block height from mempool.space."""
-    import json, httpx
-    try:
-        with httpx.Client(timeout=8) as client:
-            r = client.get("https://mempool.space/api/blocks/tip/height")
-            if r.status_code == 200:
-                return json.dumps({"block_height": int(r.text)}, indent=2)
-            return json.dumps({"error": f"HTTP {r.status_code}"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    return _envelope(await _get(f"/api/v2/streams/{stream}"), tier="pro")
 
 
 # ═══════════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════════
+
+def _resolve_require_key(require: bool, expected_key: str) -> str:
+    """Fail-closed gate (BRS-002): if a key gate is requested but the secret is
+    empty, refuse to start. Never silently downgrade auth to keyless.
+
+    Returns the expected key when the gate is armed, "" when keyless.
+    Raises SystemExit(1) when armed with no secret.
+    """
+    if require and not expected_key:
+        print("ERROR: --require-key set but BRS_MCP_SERVER_KEY is empty — "
+              "refusing to start (fail-closed). Set BRS_MCP_SERVER_KEY to "
+              "enforce, or drop --require-key to run keyless.", flush=True)
+        raise SystemExit(1)
+    return expected_key if require else ""
+
 
 def _run_streamable_http(args) -> None:
     """Run the streamable-http transport, with an OPT-IN API-key gate.
@@ -526,11 +862,7 @@ def _run_streamable_http(args) -> None:
     app.add_middleware(_ClientKeyPass)
 
     require = bool(args.require_key)
-    expected = os.environ.get("BRS_MCP_SERVER_KEY", "") if require else ""
-    if require and not expected:
-        print("WARNING: --require-key set but BRS_MCP_SERVER_KEY is empty — "
-              "auth DISABLED; set BRS_MCP_SERVER_KEY to enforce.")
-        require = False
+    expected = _resolve_require_key(require, os.environ.get("BRS_MCP_SERVER_KEY", ""))
 
     # Q58 security ruling: the public /mcp must run KEYLESS (free-tier proxy).
     # A server BRS_API_KEY would turn /mcp into a free Pro firehose (no
