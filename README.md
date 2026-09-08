@@ -97,8 +97,15 @@ When all three agree → conviction. When they disagree → silence.
 ## MCP Tools
 
 **7 tools.** Discovery is authorization-scoped: keyless callers see only the
-4 Free tools; a caller presenting a key sees all 7 (the upstream API still
-enforces Pro on call).
+4 Free tools; a caller presenting a key sees all 7. No Pro tool serves data
+keyless — the metered tool below surfaces its x402 payment challenge keyless,
+but never data.
+
+> **New to this server?** Call `brs_market_state` (free) first — it shows the
+> current regime, three-eye convergence, and system health. Need the directional
+> posture one time? Call `brs_decision_context` with **no key**, read
+> `error.payment` from the `PAYMENT_REQUIRED` result, pay, and re-call with the
+> `tx_signature`.
 
 ### Free — no key required
 

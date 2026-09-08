@@ -114,7 +114,13 @@ Continue → `~/.continue/config.json`
 
 Discovery is **authorization-scoped** (BRS-013): keyless callers see only the
 4 Free tools; a caller presenting a key sees all 7. The upstream API still
-enforces Pro on call — no Pro tool is callable keyless.
+enforces Pro on call — no Pro tool serves data keyless.
+
+> **Find the paid tool:** `brs_market_state` (free) shows regime, convergence,
+> and health first. Directional posture is payable **per-call via x402** — call
+> `brs_decision_context` with **no key**, read `error.payment` from the
+> `PAYMENT_REQUIRED` result, pay the challenge, then re-call with the
+> `tx_signature` to receive the posture. No signup required (BRS-017/BRS-021).
 
 ### Free — no key required
 
@@ -405,8 +411,16 @@ returned "Cannot connect to https://api.brs-signals.com" — that subdomain
 has no DNS record. The handshake proves routing, NOT that data flows. After
 any launch/restart, call a real tool:
 
+> **Legacy session flow (current v1 deployment).** This probe speaks the
+> session-based protocol (`initialize` + `Mcp-Session-Id`,
+> `protocolVersion` ≤ 2025-11-25) — the flow the deployed mcp 1.x server
+> (1.28.0) serves today. It stays the correct probe for this server; when the
+> mcp 2.x build serves the 2026-07-28 stateless revision, it gets its own probe
+> (no session id; `MCP-Protocol-Version` header) — see
+> [plans/2026-09-08_mcp_conformance_2026-07-28.md](../plans/2026-09-08_mcp_conformance_2026-07-28.md).
+
 ```python
-# streamable-http flow: initialize -> notifications/initialized -> tools/call
+# LEGACY session flow (v1 deployment): initialize -> notifications/initialized -> tools/call
 import httpx
 BASE = "https://brs-signals.com/mcp"
 H = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}

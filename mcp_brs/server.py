@@ -20,9 +20,14 @@ Auth model (BRS-013, audit §5.5):
   - OAuth/scopes are reserved for persistent users long-term; a static shared
     server key is NOT a paid-user identity and is rejected for public launch.
 
-Authorization-scoped discovery: keyless callers see only the 4 Free tools;
-a caller presenting a key sees the full 7-tool surface, and the upstream BRS
-API still enforces Pro (401/402) on call — no Pro tool is callable keyless.
+Authorization-scoped discovery: keyless callers see the 4 Free tools PLUS the
+metered posture (brs_decision_context) so its schema and payment instructions
+are discoverable; a caller presenting a key sees the full 7-tool surface, and
+the upstream BRS API still enforces Pro (401/402) on call — no Pro tool SERVES
+DATA keyless. The metered tool (brs_decision_context) IS callable keyless by
+design: a keyless call reaches /api/v2/bias/per-call and returns the x402
+payment challenge in error.payment, which a caller pays and re-presents as
+tx_signature to unlock that single request (BRS-017, BRS-021 policy row 1).
 
 Telemetry (BRS-018): every tool call emits one append-only, non-PII event
 (tool, tier, outcome, error_code, duration_ms, client fingerprint) to
@@ -35,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -47,8 +53,10 @@ from typing import Any, AsyncIterator, Literal, Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import Tool as MCPTool, ToolAnnotations
+from mcp.types import CallToolResult, Tool as MCPTool, ToolAnnotations
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 # ── Configuration ──────────────────────────────────────────────────
 
@@ -122,11 +130,16 @@ async def _lifespan(app: FastMCP) -> AsyncIterator[None]:
 # OAuth/scopes are reserved for persistent users long-term. A static shared
 # server key is NOT a paid-user identity (Q58: rejected for public launch).
 #
-# Discovery reflects the caller's tier: keyless callers see only Free tools;
-# a caller presenting a key sees the full surface, and the upstream BRS API
-# still enforces Pro (401/402) on call — no Pro tool is callable keyless.
+# Discovery reflects the caller's tier: keyless callers see the Free tools PLUS
+# the metered posture (discoverable schema + payment instructions); a caller
+# presenting a key sees the full surface, and the upstream BRS API still
+# enforces Pro (401/402) on call — no Pro tool SERVES DATA keyless.
 _FREE_TIER_META: dict[str, str] = {"tier": "free"}
 _PRO_TIER_META: dict[str, str] = {"tier": "pro"}
+# The metered posture stays visible to keyless callers BY DESIGN: discovery must
+# advertise it (schema + payment instructions) so an agent can find and pay it
+# without already knowing the name (BRS-021c keyless-discoverability gap).
+_METERED_TOOL: str = "brs_decision_context"
 
 
 def _has_key() -> bool:
@@ -142,7 +155,12 @@ class _TieredFastMCP(FastMCP):
         tools = await super().list_tools()
         if _has_key():
             return tools
-        return [t for t in tools if (t.meta or {}).get("tier") != "pro"]
+        # Keyless discovery shows the 4 Free tools PLUS the metered posture so
+        # its schema and payment instructions are discoverable (BRS-021c).
+        return [
+            t for t in tools
+            if (t.meta or {}).get("tier") != "pro" or t.name == _METERED_TOOL
+        ]
 
     @staticmethod
     def _outcome_of(result: Any) -> tuple[str, Optional[str]]:
@@ -178,6 +196,28 @@ class _TieredFastMCP(FastMCP):
         except Exception:
             return None
 
+    @staticmethod
+    def _normalize_error_result(result: Any) -> Any:
+        """Signal failed execution with ``isError:true`` while PRESERVING the
+        structured error envelope (and its payment challenge) for x402-aware
+        clients (BRS-021c corrected isError ruling).
+
+        A successfully calculated WAIT/abstention remains a successful result
+        (``status`` is not ``"error"``) and passes through unchanged, so it
+        stays ``isError`` unset/false. Only business/API failures — which ride
+        the typed envelope with ``status:"error"`` — are re-marked at the MCP
+        level, and their ``structuredContent`` is never nulled.
+        """
+        if isinstance(result, tuple) and len(result) == 2:
+            content, structured = result
+            if isinstance(structured, dict) and structured.get("status") == "error":
+                return CallToolResult(
+                    content=list(content),
+                    structuredContent=structured,
+                    isError=True,
+                )
+        return result
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool, then record one non-PII telemetry event (BRS-018).
 
@@ -206,7 +246,7 @@ class _TieredFastMCP(FastMCP):
             duration_ms=int((time.monotonic() - started) * 1000),
             client_id=self._client_id(), client_key=_client_key.get(),
         )
-        return result
+        return self._normalize_error_result(result)
 
 
 mcp = _TieredFastMCP(
@@ -217,7 +257,11 @@ mcp = _TieredFastMCP(
     "funding velocity, whale flows) every 30s and reject almost everything. "
     "Only when all three converge does a bullish/bearish/WAIT call come out, "
     "with evidence attached. The gate-by-gate rejection funnel is public — so "
-    "you can audit the silence, not just the signals.",
+    "you can audit the silence, not just the signals. "
+    "Start with brs_market_state (free) for regime, convergence, and health. "
+    "Directional posture is payable per-call via x402: call brs_decision_context "
+    "with no key, read error.payment from the PAYMENT_REQUIRED response, pay the "
+    "challenge, then re-call with the tx_signature to receive the posture.",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=_ALLOWED_HOSTS,
@@ -743,8 +787,10 @@ async def brs_system_status() -> ResultEnvelope:
       - component health: collector/engine status and last-good timestamps
       - system counters: signals sent, data points collected, days collecting
       - slo: status, measured latency_ms, boot-epoch uptime, and the
-        registry compliance_pct (generated from canonical metadata, not an
-        ad-hoc claim)
+        configured registry compliance_pct — scope is "registry metadata
+        checks" only (see compliance_note); it is NOT protocol conformance
+        (BRS-021f: this v1 server serves up to 2025-11-25) and NOT
+        operational health (the measured fields above)
 
     Call this when any reading looks stale or absent, and to see exactly how
     small the sample behind a claim is. Small samples cannot prove an edge.
@@ -773,8 +819,11 @@ async def brs_system_status() -> ResultEnvelope:
         "uptime_seconds": uptime.get("uptime_seconds"),
         "boot_epoch": uptime.get("boot_epoch"),
         "compliance_pct": _metadata.COMPLIANCE_PCT,
-        "compliance_note": "generated from canonical metadata (BRS-014); "
-                           "CI drift-check fails on any mismatch",
+        "compliance_note": "registry metadata checks (BRS-014): server-card/"
+                           "glama.json/mcpb manifest generated from canonical "
+                           "metadata, CI drift-check green. NOT protocol "
+                           "conformance (serves <= 2025-11-25 — BRS-021f) and "
+                           "NOT operational health (see measured fields above)",
         "latency_ms": latency_ms,
         "measured_at": _iso_now(),
     }
@@ -821,6 +870,86 @@ def _resolve_require_key(require: bool, expected_key: str) -> str:
     return expected_key if require else ""
 
 
+class _ClientKeyPass(BaseHTTPMiddleware):
+    """Q58 Option C — per-client key pass-through (always on).
+
+    Capture the caller's OWN key from the request and stash it in the
+    ``_client_key`` context var for the request's duration; ``_headers()``
+    then forwards it verbatim upstream. The server holds no key material and
+    never logs it. No key on the request => free tier (keyless proxy); a key
+    => that caller's own tier, with per-key rate attribution preserved
+    upstream.
+
+    Defined at module scope (BRS-021c) so the app the transport test drives is
+    the SAME app production serves: ``_build_streamable_http_app()`` adds this
+    middleware exactly as ``_run_streamable_http`` always has.
+    """
+
+    async def dispatch(self, request, call_next):
+        auth = request.headers.get("authorization", "")
+        key = ""
+        if auth.lower().startswith("bearer "):
+            key = auth[7:].strip()
+        else:
+            key = (request.headers.get("x-api-key") or "").strip()
+        token = _client_key.set(key)
+        try:
+            return await call_next(request)
+        finally:
+            _client_key.reset(token)
+
+
+class _KeyAuth(BaseHTTPMiddleware):
+    """OPT-IN server-key gate for streamable-http (fail-closed, BRS-002).
+
+    When armed (``--require-key``), every request must present the server key
+    via ``Authorization: Bearer <key>`` or ``X-API-Key: <key>`` compared in
+    constant time. Default OFF so the free-tier UX is unchanged — the operator
+    opts in at launch. Applied OUTSIDE ``_ClientKeyPass`` so a rejected request
+    never reaches the per-client key capture.
+    """
+
+    def __init__(self, app, expected_key: str = ""):
+        super().__init__(app)
+        self._expected = expected_key
+
+    async def dispatch(self, request, call_next):
+        auth = request.headers.get("authorization", "")
+        key = request.headers.get("x-api-key", "")
+        if auth.startswith("Bearer "):
+            key = auth[len("Bearer "):].strip()
+        ok = bool(key) and hmac.compare_digest(key, self._expected)
+        if not ok:
+            return JSONResponse(
+                {"error": "Unauthorized — set BRS_API_KEY "
+                          "(Authorization: Bearer <key> or X-API-Key)"},
+                status_code=401,
+            )
+        return await call_next(request)
+
+
+def _build_streamable_http_app(require_key: bool = False):
+    """Assemble the streamable-http ASGI app EXACTLY as the entry point does.
+
+    Single construction point (BRS-021c) shared by ``_run_streamable_http``
+    (production) and the real-transport tests, so a test drives the identical
+    middleware stack — per-client key pass-through always on, optional outer
+    server-key gate — and the identical session manager the deployed server
+    serves.
+
+    Returns the Starlette app (after middleware is added, which can no longer
+    change) so callers may still attach transport-level routes.
+    """
+    app = mcp.streamable_http_app()
+    app.add_middleware(_ClientKeyPass)
+    if require_key:
+        expected = _resolve_require_key(
+            True, os.environ.get("BRS_MCP_SERVER_KEY", "")
+        )
+        app.add_middleware(_KeyAuth, expected_key=expected)
+    return app
+
+
 def _run_streamable_http(args) -> None:
     """Run the streamable-http transport, with an OPT-IN API-key gate.
 
@@ -832,37 +961,9 @@ def _run_streamable_http(args) -> None:
     so the free-tier UX is unchanged — the operator opts in at launch.
     """
     import uvicorn
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import JSONResponse
-
-    app = mcp.streamable_http_app()
-
-    # Q58 Option C — per-client key pass-through (always on, independent of the
-    # --require-key gate). Capture the caller's own key from the request and
-    # forward it verbatim upstream; server holds nothing, never logs. No key =>
-    # free tier; a key => that caller's own tier (per-key rate attribution
-    # preserved upstream). Visibility: logged as enabled at startup.
-    class _ClientKeyPass(BaseHTTPMiddleware):
-        def __init__(self, inner_app):
-            super().__init__(inner_app)
-
-        async def dispatch(self, request, call_next):
-            auth = request.headers.get("authorization", "")
-            key = ""
-            if auth.lower().startswith("bearer "):
-                key = auth[7:].strip()
-            else:
-                key = (request.headers.get("x-api-key") or "").strip()
-            token = _client_key.set(key)
-            try:
-                return await call_next(request)
-            finally:
-                _client_key.reset(token)
-
-    app.add_middleware(_ClientKeyPass)
 
     require = bool(args.require_key)
-    expected = _resolve_require_key(require, os.environ.get("BRS_MCP_SERVER_KEY", ""))
+    app = _build_streamable_http_app(require_key=require)
 
     # Q58 security ruling: the public /mcp must run KEYLESS (free-tier proxy).
     # A server BRS_API_KEY would turn /mcp into a free Pro firehose (no
@@ -880,30 +981,6 @@ def _run_streamable_http(args) -> None:
         print("WARNING: BRS_API_KEY is set — per Q58 do NOT run the public "
               "/mcp keyed (free Pro firehose, no revocation). Remove it.",
               flush=True)
-
-    if require:
-        import hmac
-
-        class _KeyAuth(BaseHTTPMiddleware):
-            def __init__(self, app, expected_key: str = ""):
-                super().__init__(app)
-                self._expected = expected_key
-
-            async def dispatch(self, request, call_next):
-                auth = request.headers.get("authorization", "")
-                key = request.headers.get("x-api-key", "")
-                if auth.startswith("Bearer "):
-                    key = auth[len("Bearer "):].strip()
-                ok = bool(key) and hmac.compare_digest(key, self._expected)
-                if not ok:
-                    return JSONResponse(
-                        {"error": "Unauthorized — set BRS_API_KEY "
-                                  "(Authorization: Bearer <key> or X-API-Key)"},
-                        status_code=401,
-                    )
-                return await call_next(request)
-
-        app.add_middleware(_KeyAuth, expected_key=expected)
 
     config = uvicorn.Config(app, host=args.host, port=args.port,
                             log_level="info")
