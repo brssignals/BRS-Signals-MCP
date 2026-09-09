@@ -41,6 +41,7 @@ import asyncio
 import contextvars
 import hashlib
 import hmac
+import importlib.metadata as _pkg
 import json
 import os
 import time
@@ -51,7 +52,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Literal, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, Tool as MCPTool, ToolAnnotations
 from pydantic import BaseModel, Field
@@ -113,7 +114,7 @@ async def _get_client() -> httpx.AsyncClient:
 
 
 @asynccontextmanager
-async def _lifespan(app: FastMCP) -> AsyncIterator[None]:
+async def _lifespan(app: MCPServer) -> AsyncIterator[None]:
     """Create the pooled client on startup, close it on shutdown."""
     client = await _get_client()
     try:
@@ -148,8 +149,8 @@ def _has_key() -> bool:
     return bool(_client_key.get() or API_KEY)
 
 
-class _TieredFastMCP(FastMCP):
-    """FastMCP with authorization-scoped discovery (BRS-013) + telemetry (BRS-018)."""
+class _TieredFastMCP(MCPServer):
+    """MCPServer with authorization-scoped discovery (BRS-013) + telemetry (BRS-018)."""
 
     async def list_tools(self) -> list[MCPTool]:
         tools = await super().list_tools()
@@ -166,11 +167,14 @@ class _TieredFastMCP(FastMCP):
     def _outcome_of(result: Any) -> tuple[str, Optional[str]]:
         """Derive (outcome, error_code) from a tool result envelope.
 
-        Handles both structured (tuple of content + dict) and unstructured
-        (ContentBlock list) FastMCP results. Never raises.
+        Handles v2 ``CallToolResult`` (structured_content), the legacy v1
+        structured tuple (content + dict), and plain dicts. Never raises.
         """
         payload: dict[str, Any] = {}
-        if isinstance(result, tuple):
+        if isinstance(result, CallToolResult):
+            if isinstance(result.structured_content, dict):
+                payload = result.structured_content
+        elif isinstance(result, tuple):
             for part in result:
                 if isinstance(part, dict):
                     payload = part
@@ -190,9 +194,12 @@ class _TieredFastMCP(FastMCP):
             outcome = status
         return outcome, code
 
-    def _client_id(self) -> Optional[str]:
+    def _client_id(self, context: Any = None) -> Optional[str]:
         try:
-            return self.get_context().client_id
+            if context is None:
+                return None
+            meta = getattr(context.request_context, "meta", None)
+            return (meta or {}).get("client_id")
         except Exception:
             return None
 
@@ -208,17 +215,28 @@ class _TieredFastMCP(FastMCP):
         the typed envelope with ``status:"error"`` — are re-marked at the MCP
         level, and their ``structuredContent`` is never nulled.
         """
+        if isinstance(result, CallToolResult):
+            sc = result.structured_content
+            if isinstance(sc, dict) and sc.get("status") == "error":
+                return CallToolResult(
+                    content=result.content,
+                    structured_content=sc,
+                    is_error=True,
+                )
+            return result
         if isinstance(result, tuple) and len(result) == 2:
             content, structured = result
             if isinstance(structured, dict) and structured.get("status") == "error":
                 return CallToolResult(
                     content=list(content),
-                    structuredContent=structured,
-                    isError=True,
+                    structured_content=structured,
+                    is_error=True,
                 )
         return result
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], context: Any = None
+    ) -> Any:
         """Call a tool, then record one non-PII telemetry event (BRS-018).
 
         The event captures tool name, tier, outcome, error code and latency —
@@ -231,26 +249,27 @@ class _TieredFastMCP(FastMCP):
         tier = "pro" if _has_key() else "free"
         started = time.monotonic()
         try:
-            result = await super().call_tool(name, arguments)
+            result = await super().call_tool(name, arguments, context)
         except Exception:
             telemetry.record(
                 name, tier=tier, outcome="exception",
                 error_code="INTERNAL_ERROR",
                 duration_ms=int((time.monotonic() - started) * 1000),
-                client_id=self._client_id(), client_key=_client_key.get(),
+                client_id=self._client_id(context), client_key=_client_key.get(),
             )
             raise
         outcome, code = self._outcome_of(result)
         telemetry.record(
             name, tier=tier, outcome=outcome, error_code=code,
             duration_ms=int((time.monotonic() - started) * 1000),
-            client_id=self._client_id(), client_key=_client_key.get(),
+            client_id=self._client_id(context), client_key=_client_key.get(),
         )
         return self._normalize_error_result(result)
 
 
 mcp = _TieredFastMCP(
     "brs-signals",
+    version=_pkg.version("mcp"),
     lifespan=_lifespan,
     instructions="₿RS Signals — pre-price, three-eye Bitcoin signals. "
     "Three independent sensors read pre-price flows (mempool fee-curve shape, "
@@ -262,10 +281,6 @@ mcp = _TieredFastMCP(
     "Directional posture is payable per-call via x402: call brs_decision_context "
     "with no key, read error.payment from the PAYMENT_REQUIRED response, pay the "
     "challenge, then re-call with the tx_signature to receive the posture.",
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=_ALLOWED_HOSTS,
-    ),
 )
 
 # ── Shared HTTP Client ─────────────────────────────────────────────
@@ -1070,7 +1085,11 @@ class _KeyAuth(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def _build_streamable_http_app(require_key: bool = False):
+def _build_streamable_http_app(
+    require_key: bool = False,
+    mount_path: str = "/mcp",
+    host: str = "127.0.0.1",
+):
     """Assemble the streamable-http ASGI app EXACTLY as the entry point does.
 
     Single construction point (BRS-021c) shared by ``_run_streamable_http``
@@ -1082,7 +1101,14 @@ def _build_streamable_http_app(require_key: bool = False):
     Returns the Starlette app (after middleware is added, which can no longer
     change) so callers may still attach transport-level routes.
     """
-    app = mcp.streamable_http_app()
+    app = mcp.streamable_http_app(
+        streamable_http_path=mount_path,
+        host=host,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=_ALLOWED_HOSTS,
+        ),
+    )
     app.add_middleware(_ClientKeyPass)
     if require_key:
         expected = _resolve_require_key(
@@ -1105,7 +1131,11 @@ def _run_streamable_http(args) -> None:
     import uvicorn
 
     require = bool(args.require_key)
-    app = _build_streamable_http_app(require_key=require)
+    app = _build_streamable_http_app(
+        require_key=require,
+        mount_path=args.mount_path,
+        host=args.host,
+    )
 
     # Q58 security ruling: the public /mcp must run KEYLESS (free-tier proxy).
     # A server BRS_API_KEY would turn /mcp into a free Pro firehose (no
@@ -1170,13 +1200,8 @@ def main():
     if args.transport == "stdio":
         mcp.run(transport="stdio")
     elif args.transport == "sse":
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
-        mcp.run(transport="sse")
+        mcp.run(transport="sse", host=args.host, port=args.port)
     else:  # streamable-http
-        mcp.settings.host = args.host
-        mcp.settings.port = args.port
-        mcp.settings.streamable_http_path = args.mount_path
         _run_streamable_http(args)
 
 

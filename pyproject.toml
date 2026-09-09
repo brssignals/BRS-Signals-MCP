@@ -31,12 +31,11 @@ classifiers = [
 ]
 
 dependencies = [
-    # server.py targets the mcp 1.x SDK: it imports mcp.server.fastmcp.FastMCP
+    # server.py targets the mcp 2.x SDK: it imports mcp.server.mcpserver.MCPServer
     # and mcp.server.transport_security (DNS-rebinding protection), and calls
-    # mcp.streamable_http_app(). mcp 2.0.0 restructured all of that, so the
-    # upper bound is REQUIRED — an unbounded install picks up 2.0.0 and breaks
-    # at import. (Upgrading to mcp 2.x is a separate build; verified live on 1.28.0.)
-    "mcp>=1.28.0,<2.0.0",
+    # mcp.streamable_http_app(). The upper bound pins the 2.x line so an
+    # unbounded install cannot drift to a future 3.x before re-validation.
+    "mcp>=2.0.0,<3.0.0",
     "httpx>=0.25.0",
 ]
 
