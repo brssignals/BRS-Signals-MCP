@@ -431,16 +431,15 @@ returned "Cannot connect to https://api.brs-signals.com" — that subdomain
 has no DNS record. The handshake proves routing, NOT that data flows. After
 any launch/restart, call a real tool:
 
-> **Legacy session flow (current v1 deployment).** This probe speaks the
-> session-based protocol (`initialize` + `Mcp-Session-Id`,
-> `protocolVersion` ≤ 2025-11-25) — the flow the deployed mcp 1.x server
-> (1.28.0) serves today. It stays the correct probe for this server; when the
-> mcp 2.x build serves the 2026-07-28 stateless revision, it gets its own probe
-> (no session id; `MCP-Protocol-Version` header) — see
-> [plans/2026-09-08_mcp_conformance_2026-07-28.md](../plans/2026-09-08_mcp_conformance_2026-07-28.md).
+> **Dual-era server (mcp 2.x deployment).** One endpoint serves BOTH protocol
+> generations: the modern stateless revision **2026-07-28** (`server/discover`,
+> no session id, `MCP-Protocol-Version` header, per-request `_meta`) AND the
+> legacy session flow (`initialize` + `Mcp-Session-Id`, `protocolVersion` ≤
+> 2025-11-25). The legacy probe below stays valid for backward-compatible
+> clients; a modern-only client probes `server/discover` instead.
 
 ```python
-# LEGACY session flow (v1 deployment): initialize -> notifications/initialized -> tools/call
+# LEGACY session flow: initialize -> notifications/initialized -> tools/call
 import httpx
 BASE = "https://brs-signals.com/mcp"
 H = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}

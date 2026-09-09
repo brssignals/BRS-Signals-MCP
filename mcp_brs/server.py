@@ -59,6 +59,11 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
+# Canonical product metadata (BRS-003 pure-data single source of truth). Safe to
+# import at module level: metadata.py carries zero SDK/config imports, so there
+# is no circular import with mcp_brs/__init__.
+from mcp_brs import metadata
+
 # ── Configuration ──────────────────────────────────────────────────
 
 # api.brs-signals.com has no DNS record (verified Aug 15) — default to the
@@ -267,9 +272,14 @@ class _TieredFastMCP(MCPServer):
         return self._normalize_error_result(result)
 
 
+# Server identity (BRS-021f Day 2): serverInfo.version advertises the BRS
+# package/release (metadata.VERSION = "0.1.4"), NOT the SDK version. The SDK
+# version is recorded separately below for the evidence bundle.
+_SDK_VERSION = _pkg.version("mcp")
+
 mcp = _TieredFastMCP(
     "brs-signals",
-    version=_pkg.version("mcp"),
+    version=metadata.VERSION,
     lifespan=_lifespan,
     instructions="₿RS Signals — pre-price, three-eye Bitcoin signals. "
     "Three independent sensors read pre-price flows (mempool fee-curve shape, "
@@ -930,8 +940,8 @@ async def brs_system_status() -> ResultEnvelope:
         observation_window discloses the 24h coverage and flags insufficient
         history explicitly. compliance_pct scope is "registry metadata checks"
         only (see compliance_note) — NOT protocol conformance (BRS-021f: this
-        v1 server serves up to 2025-11-25) and NOT operational health (the
-        measured fields above)
+        server serves 2026-07-28 modern + legacy ≤ 2025-11-25) and NOT
+        operational health (the measured fields above)
 
     Call this when any reading looks stale or absent, and to see exactly how
     small the sample behind a claim is. Small samples cannot prove an edge.
@@ -964,8 +974,9 @@ async def brs_system_status() -> ResultEnvelope:
             "compliance_note": "registry metadata checks (BRS-014): server-card/"
                                "glama.json/mcpb manifest generated from canonical "
                                "metadata, CI drift-check green. NOT protocol "
-                               "conformance (serves <= 2025-11-25 — BRS-021f) and "
-                               "NOT operational health (see measured below)",
+                               "conformance (serves 2026-07-28 modern + legacy "
+                               "<= 2025-11-25 — BRS-021f) and NOT operational "
+                               "health (see measured below)",
         },
         "measured": {
             "uptime_24h_pct": uptime.get("uptime_24h_pct"),
