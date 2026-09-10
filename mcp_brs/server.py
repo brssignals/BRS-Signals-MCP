@@ -934,7 +934,10 @@ async def brs_system_status() -> ResultEnvelope:
 
     Bundles two keyless reads plus a measured SLO block:
       - component health: collector/engine status and last-good timestamps
-      - system counters: signals sent, data points collected, days collecting
+      - system counters: signals sent, data points collected, days collecting.
+        "Signals sent" is the authoritative all-time count from
+        decoder_decision_records — the same figure the funnel and the landing
+        page show, so every surface agrees.
       - slo: status; CONFIGURED (compliance_pct + scope note) vs MEASURED
         (uptime_24h_pct, boot-epoch uptime, latency_ms) kept apart; an
         observation_window discloses the 24h coverage and flags insufficient
