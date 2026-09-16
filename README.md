@@ -133,8 +133,7 @@ but never data.
 - **Free tier** — Regime + convergence + the public proof (5 req/min). No card.
 - **Per-call ($0.01/query)** — the full reading one query at a time via x402
   (USDC on Solana or Base): hit `/api/v2/bias/per-call`, pay the 402, retry
-  with `?tx_signature=` + your free key. Capped at $50 per rolling 30 days —
-  never more than $50 in any 30 days.
+  with `?tx_signature=` + your free key. Pay-as-you-go, no cap.
 - **x402** — Agents with wallets pay per access in USDC; no signup, no human.
 
 Get your API key at [brs-signals.com](https://brs-signals.com).

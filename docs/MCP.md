@@ -314,8 +314,7 @@ curves, funding, stablecoins hidden). Rate: 5 req/min.
 
 **Per-call** — the full reading one query at a time: `GET /api/v2/bias/per-call`
 returns a 402 with an exact $0.01 USDC settlement (Solana or Base); pay it,
-retry with `?tx_signature=` + your free key. Capped at $50 per rolling 30 days
-— never more than $50 in any 30 days.
+retry with `?tx_signature=` + your free key. Pay-as-you-go, no cap.
 
 Get a key at [https://brs-signals.com](https://brs-signals.com).
 

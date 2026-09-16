@@ -74,28 +74,24 @@ TIERS.update({t: "pro" for t in PRO_TOOLS})
 
 # ── Copy (single description / pricing / instructions) ──────────────
 DESCRIPTION_LONG = (
-    "Should you be trading Bitcoin right now? Three independent sensors read "
-    "pre-price flows (mempool fee-curve shape, funding velocity, whale flows) "
-    "every 30s and reject almost everything. Only when all three converge does "
-    "a directional call come out, with evidence attached. The gate-by-gate "
-    "rejection funnel is public — so you can audit the silence, not just the "
-    "signals. The data can't be reconstructed from history. Free tier, no "
-    "card; Pro $50/mo, or pay-as-you-go at $0.01/query via x402 (USDC on "
-    "Solana or Base, capped at $50 per 30 days then converts to Pro) — never "
-    "more than $50 in any 30 days."
+    "Three independent sensors read Bitcoin's market structure (mempool "
+    "fee-curve shape, funding velocity, whale flows) every 30s and reject "
+    "almost everything. The gate-by-gate rejection funnel is public — so you "
+    "can audit the silence, not just the readings. This is the science behind "
+    "the ORE Signals daily plate. Free tier, no card; pay-as-you-go at "
+    "$0.01/query via x402 (USDC on Solana or Base)."
 )
 
 DESCRIPTION_SHORT = (
-    "Live Bitcoin market regime for agents: three independent sensors read "
-    "pre-price data every 30s and reject almost everything — when they "
-    "converge, you get a directional call with the evidence attached. The "
-    "public rejection funnel lets your agent audit the silence, not just the "
-    "signals. MCP + REST + x402. Free tier, no card."
+    "Live Bitcoin market-structure readings for agents: three independent "
+    "sensors read the market every 30s and reject almost everything — the "
+    "science behind the ORE Signals daily plate. The public rejection funnel "
+    "lets your agent audit the silence. MCP + REST + x402. Free tier, no card."
 )
 
 PRICING_STRING = (
-    "Free tier, no card. Pro $50/mo (card) or $0.01 per query via x402 "
-    "(USDC, Solana or Base) — capped at $50 per 30 days, then converts to Pro."
+    "Free tier, no card. $0.01 per query via x402 (USDC, Solana or Base) — "
+    "uncapped pay-as-you-go."
 )
 
 AUTH_INSTRUCTIONS = (
