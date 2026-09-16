@@ -97,7 +97,7 @@ When all three agree → conviction. When they disagree → silence.
 ## MCP Tools
 
 **7 tools.** Discovery is authorization-scoped: keyless callers see only the
-4 Free tools; a caller presenting a key sees all 7. No Pro tool serves data
+4 Free tools; a caller presenting a key sees all 7. No paid tool serves data
 keyless — the metered tool below surfaces its x402 payment challenge keyless,
 but never data.
 
@@ -116,7 +116,7 @@ but never data.
 | `brs_rejection_funnel` | Per-gate cycle counts: why no signal came out |
 | `brs_system_status` | Component health + sample size behind every reading |
 
-### Pro — key or x402 required
+### Paid — key or x402 required
 
 | Tool | What it returns |
 |------|-----------------|
@@ -130,14 +130,11 @@ but never data.
 
 ## Pricing
 
-- **Free tier** — Regime classification + convergence score + the public
-  proof (5 req/min). No card.
-- **Pro tier ($50/mo)** — Directional posture + raw streams + full history,
-  60 req/min.
-- **Per-call ($0.01/query)** — the Pro posture one query at a time via x402
+- **Free tier** — Regime + convergence + the public proof (5 req/min). No card.
+- **Per-call ($0.01/query)** — the full reading one query at a time via x402
   (USDC on Solana or Base): hit `/api/v2/bias/per-call`, pay the 402, retry
-  with `?tx_signature=` + your free key. Capped at $50 per rolling 30 days,
-  then converts to Pro — never more than $50 in any 30 days.
+  with `?tx_signature=` + your free key. Capped at $50 per rolling 30 days —
+  never more than $50 in any 30 days.
 - **x402** — Agents with wallets pay per access in USDC; no signup, no human.
 
 Get your API key at [brs-signals.com](https://brs-signals.com).

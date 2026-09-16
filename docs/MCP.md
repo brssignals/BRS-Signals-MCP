@@ -307,19 +307,15 @@ identified. Set `BRS_MCP_TELEMETRY=0` to disable it.
 |------|-------|-----------|-------------|
 | **Free** | $0 | 5 req/min | No |
 | **Per-call** | $0.01 / query | pay-as-you-go | Free key + `?tx_signature=` |
-| **Pro** | $50/mo | 60 req/min | Yes |
 
 **Free tier** shows outputs only — convergence score, regime classification,
 track record, rejection funnel, system status. No raw collector data (fee
 curves, funding, stablecoins hidden). Rate: 5 req/min.
 
-**Per-call** — the Pro posture one query at a time: `GET /api/v2/bias/per-call`
+**Per-call** — the full reading one query at a time: `GET /api/v2/bias/per-call`
 returns a 402 with an exact $0.01 USDC settlement (Solana or Base); pay it,
 retry with `?tx_signature=` + your free key. Capped at $50 per rolling 30 days
-and converts to Pro at the cap — never more than $50 in any 30 days.
-
-**Pro tier** unlocks everything: directional posture, raw streams, full
-history, 60 req/min.
+— never more than $50 in any 30 days.
 
 Get a key at [https://brs-signals.com](https://brs-signals.com).
 
